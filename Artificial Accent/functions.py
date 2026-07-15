@@ -75,21 +75,21 @@ def azure_ipa(text, ipa, language, synthesis_voice_name, output_file,
 
     result = synthesizer.speak_ssml_async(ssml).get()
 
-    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-        print(f"Created: {output_file}")
-        return True
+    # if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+    #     print(f"Created: {output_file}")
+    #     return True
 
-    elif result.reason == speechsdk.ResultReason.Canceled:
+    # elif result.reason == speechsdk.ResultReason.Canceled:
 
-        details = result.cancellation_details
+    #     details = result.cancellation_details
 
-        print("Speech synthesis canceled")
-        print("Reason:", details.reason)
+    #     print("Speech synthesis canceled")
+    #     print("Reason:", details.reason)
 
-        if details.reason == speechsdk.CancellationReason.Error:
-            print("Error:", details.error_details)
+    #     if details.reason == speechsdk.CancellationReason.Error:
+    #         print("Error:", details.error_details)
 
-        return False
+    #     return False
     
 def azure_text(text, language, synthesis_voice_name, output_file,
                rate="0%", volume="0%", pitch="0%", speech_config=speech_config):
