@@ -108,11 +108,14 @@ def create_blends() -> dict[str, torch.Tensor]:
         # "if_sara80_im_nicola20": blend_voices(voice_sara, voice_nicola, w1=0.8),
         # "if_sara20_im_nicola80": blend_voices(voice_sara, voice_nicola, w1=0.2),
         # "if_sara50_im_nicola50": blend_voices(voice_sara, voice_nicola, w1=0.5),
-        # "per_half_slerp": per_half_blend(voice_sara, voice_nicola, t_tim=0.5, t_pro=0.5)
+        # "per_half_slerp": per_half_blend(voice_sara, voice_nicola, t_tim=0.5, t_pro=0.5),
+        # "tim_50_pro_mas1": per_half_blend(voice_sara, voice_nicola, t_tim=0.5, t_pro=1),
+        # "tim_mas80_pro_mas1": per_half_blend(voice_sara, voice_nicola, t_tim=0.2, t_pro=1),
+        # "tim_fem80_pro_mas1": per_half_blend(voice_sara, voice_nicola, t_tim=0.8, t_pro=1),
     blends = {
-        "tim_50_pro_mas1": per_half_blend(voice_sara, voice_nicola, t_tim=0.5, t_pro=1),
-        "tim_mas80_pro_mas1": per_half_blend(voice_sara, voice_nicola, t_tim=0.2, t_pro=1),
-        "tim_fem80_pro_mas1": per_half_blend(voice_sara, voice_nicola, t_tim=0.8, t_pro=1),
+        # "if_sara70_im_nicola30": blend_voices(voice_sara, voice_nicola, w1=0.7),
+        "nicola95": blend_voices(voice_sara, voice_nicola, w1=0.05),
+        # "if_sara45_im_nicola55": blend_voices(voice_sara, voice_nicola, w1=0.45)
     }
 
     for name, tensor in blends.items():
