@@ -1,3 +1,4 @@
+import json
 import os
 os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
 os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
@@ -112,7 +113,7 @@ def check_ipa(ipa):
             print("   ok")
         print()
     print("=> ALL CLEAN" if clean else "=> SOME CHARS DROPPED (see above)")
-    return clean
+    return clean   
 
 """
 IPA manipulation engine for Kokoro (misaki) phoneme chunks.
@@ -261,3 +262,194 @@ def manipulate(ipa, rules, protect_affricates=True):
             s = _apply_rule(s, rule, protect_affricates)
         result.append(s)
     return result[0] if single else result
+
+
+
+
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+# uses VOCAB, VOWELS, CONSONANTS already defined in functions.py, and the `gen` pipeline
+
+SR = 24000
+FRAME_SAMPLES = 600                                    # Kokoro frames -> samples @ 24 kHz
+
+BASE     = VOWELS | CONSONANTS                         # get their own segment
+TRAILING = {'ː','ʰ','ʲ','\u0303','\u1d5d','↓','→','↗','↘'}   # glued onto preceding base (label + duration)
+LEADING  = {'ˈ','ˌ'}                                   # stress: duration folded into the NEXT phoneme
+# anything else (space, punctuation) -> a gap/pause, not emitted
+
+def align_phonemes(phonemes, pred_dur, n_samples=None, sr=SR, lead_trim_frames=0):
+    """
+    -> list of (label, start_s, end_s), one per phoneme unit.
+       trailing diacritics (ː ʰ ʲ ̃) merge into the base and stay in the label ("tː","ã","pʰ");
+       stress marks merge (duration only) into the next phoneme;
+       spaces/punctuation become gaps, so word pauses show as silence.
+    n_samples: pass len(chunk_audio) to calibrate the frame scale exactly to that audio
+               (absorbs any rounding vs the 600 constant).
+    lead_trim_frames: Kokoro's own token-timestamps trim ~3 frames off the lead pad; set 3 to match.
+    """
+    kept = [c for c in phonemes if c in VOCAB]          # exactly what became input_ids
+    dur  = [int(x) for x in pred_dur]
+    assert len(dur) == len(kept) + 2, \
+        f"pred_dur ({len(dur)}) != kept phonemes+2 ({len(kept)+2}) — filtered string mismatch"
+
+    spf = (n_samples / sum(dur)) if n_samples else FRAME_SAMPLES
+    f2s = lambda f: max(0.0, f - lead_trim_frames) * spf / sr
+
+    start_f, acc = [], 0
+    for d in dur:
+        start_f.append(acc); acc += d                   # cumulative start frame per token
+
+    segs, pending = [], None
+    for k, c in enumerate(kept, start=1):               # skip pads: tokens 1..len(kept)
+        s, e = start_f[k], start_f[k] + dur[k]
+        if c in BASE:
+            segs.append([c, pending if pending is not None else s, e]); pending = None
+        elif c in TRAILING and segs:
+            segs[-1][0] += c; segs[-1][2] = e           # keep modifier in label, extend duration
+        elif c in LEADING:
+            pending = s if pending is None else pending
+        else:
+            pending = None                              # space/punct -> gap
+    return [(lab, f2s(s), f2s(e)) for lab, s, e in segs]
+
+
+def audiovisualize(audio, segments, sr=SR, show_spec=True, figsize=(15, 5), max_hz=8000, title=None):
+    """Waveform (+ optional spectrogram) with phoneme boundaries and labels."""
+    audio = np.asarray(audio, dtype=float)
+    t = np.arange(len(audio)) / sr
+    fig, axes = plt.subplots(2 if show_spec else 1, 1, figsize=figsize, sharex=True)
+    axes = np.atleast_1d(axes)
+
+    ax = axes[0]
+    ax.plot(t, audio, lw=0.5, color='steelblue')
+    ax.set_ylabel('amplitude'); ax.set_xlim(0, t[-1] if len(t) else 1)
+    ymax = ax.get_ylim()[1]
+    for i, (lab, s, e) in enumerate(segments):
+        ax.axvspan(s, e, color='0.85' if i % 2 else 'white', alpha=0.5, lw=0)
+        ax.axvline(s, color='crimson', lw=0.6)
+        ax.text((s + e) / 2, ymax * 0.82, lab, ha='center', va='top', fontsize=9)
+    if segments: ax.axvline(segments[-1][2], color='crimson', lw=0.6)
+    if title: ax.set_title(title)
+
+    if show_spec:
+        ax2 = axes[1]
+        ax2.specgram(audio, NFFT=1024, Fs=sr, noverlap=768, cmap='magma')
+        ax2.set_ylabel('Hz'); ax2.set_ylim(0, max_hz)
+        for lab, s, e in segments:
+            ax2.axvline(s, color='white', lw=0.5, alpha=0.7)
+        if segments: ax2.axvline(segments[-1][2], color='white', lw=0.5, alpha=0.7)
+    axes[-1].set_xlabel('time (s)')
+    plt.tight_layout()
+    return fig
+
+
+def synth_aligned(ipa_chunks, voice, speed=1.0, sr=SR):
+    """Synthesize chunks, concatenate audio, and return per-phoneme segments with GLOBAL timestamps."""
+    audios, segments, t0 = [], [], 0.0
+    for ps in ipa_chunks:
+        if not ps.strip():
+            continue
+        r = next(gen.generate_from_tokens(tokens=ps, voice=voice, speed=speed))
+        a = r.audio.detach().cpu().numpy()
+        segs = align_phonemes(r.phonemes, r.pred_dur, n_samples=len(a), sr=sr)   # r.phonemes == the fed string
+        segments += [(lab, s + t0, e + t0) for lab, s, e in segs]
+        audios.append(a); t0 += len(a) / sr
+    return np.concatenate(audios), segments
+
+
+import numpy as np, base64, io, json, soundfile as sf
+from IPython.display import HTML, display
+
+def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row=None):
+    """
+    Interactive phoneme player (karaoke-style) for long text.
+      - click any phoneme to seek & play
+      - active phoneme highlights while playing; view auto-scrolls
+      - waveform strip with a moving cursor; drag to scrub; scroll-to-zoom
+      - phonemes wrap across rows so long text stays readable
+    audio, segments: from synth_aligned(). out_html: optional path to also save a standalone file.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    buf = io.BytesIO(); sf.write(buf, audio, sr, format='WAV'); 
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    # downsample waveform envelope for a light-weight canvas draw
+    N = 2000
+    step = max(1, len(audio)//N)
+    env = np.abs(audio[:step*(len(audio)//step)].reshape(-1, step)).max(axis=1)
+    env = (env/ (env.max() or 1)).round(3).tolist()
+    segs = [{"l": lab, "s": round(s,4), "e": round(e,4)} for lab, s, e in segments]
+    dur = len(audio)/sr
+
+    html = _TEMPLATE.replace("__B64__", b64).replace("__SEGS__", json.dumps(segs)) \
+                    .replace("__ENV__", json.dumps(env)).replace("__DUR__", str(dur))
+    if out_html:
+        with open(out_html, "w", encoding="utf-8") as f: f.write(html)
+    return HTML(html)   # renders inline in Jupyter
+
+_TEMPLATE = r"""
+                        <div id="pv" style="font-family:system-ui,sans-serif;max-width:960px">
+                        <audio id="au" src="data:audio/wav;base64,__B64__"></audio>
+                        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+                            <button id="pp" style="padding:6px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer">▶ play</button>
+                            <input id="sp" type="range" min="0.5" max="1.5" step="0.05" value="1" style="width:120px">
+                            <span id="spl" style="font-size:12px;color:#555">1.00×</span>
+                            <span id="tt" style="font-size:12px;color:#555;margin-left:auto">0.00 / __DUR__s</span>
+                        </div>
+                        <canvas id="wf" width="920" height="70" style="width:100%;height:70px;background:#0b1020;border-radius:6px;cursor:pointer"></canvas>
+                        <div id="ph" style="margin-top:10px;line-height:2.1;font-size:19px;letter-spacing:1px"></div>
+                        </div>
+                        <script>
+                        (function(){
+                        const segs=__SEGS__, env=__ENV__, DUR=__DUR__;
+                        const au=document.getElementById('au'), pp=document.getElementById('pp');
+                        const ph=document.getElementById('ph'), wf=document.getElementById('wf'), ctx=wf.getContext('2d');
+                        const tt=document.getElementById('tt'), sp=document.getElementById('sp'), spl=document.getElementById('spl');
+                        let view=[0,DUR];                       // zoom window (s)
+
+                        // build phoneme chips
+                        segs.forEach((g,i)=>{ const s=document.createElement('span'); s.textContent=g.l; s.dataset.i=i;
+                            s.style.cssText='padding:1px 4px;margin:1px;border-radius:5px;cursor:pointer;transition:.05s';
+                            s.onclick=()=>{au.currentTime=g.s; au.play();}; ph.appendChild(s);
+                            if(i<segs.length-1 && g.e<segs[i+1].s-0.06){ ph.appendChild(document.createTextNode('  ·  ')); } });
+                        const chips=[...ph.querySelectorAll('span')];
+
+                        function drawWave(){ const W=wf.width,H=wf.height; ctx.clearRect(0,0,W,H);
+                            const [a,b]=view, n=env.length;
+                            ctx.fillStyle='#1b2540';
+                            // active-phoneme bands
+                            segs.forEach(g=>{ if(g.e<a||g.s>b)return; const x=(g.s-a)/(b-a)*W, w=(g.e-g.s)/(b-a)*W;
+                            ctx.fillStyle=(g.s<=au.currentTime&&au.currentTime<g.e)?'#2563eb55':'#ffffff10'; ctx.fillRect(x,0,Math.max(w,1),H);});
+                            ctx.strokeStyle='#7dd3fc'; ctx.beginPath();
+                            for(let x=0;x<W;x++){ const t=a+(b-a)*x/W, idx=Math.floor(t/DUR*n); const v=env[Math.max(0,Math.min(n-1,idx))]||0;
+                            ctx.moveTo(x,H/2-v*H/2); ctx.lineTo(x,H/2+v*H/2);} ctx.stroke();
+                            const cx=(au.currentTime-a)/(b-a)*W; ctx.strokeStyle='#f43f5e'; ctx.lineWidth=2;
+                            ctx.beginPath(); ctx.moveTo(cx,0); ctx.lineTo(cx,H); ctx.stroke(); ctx.lineWidth=1;
+                        }
+                        function tick(){ const t=au.currentTime; let act=-1;
+                            for(let i=0;i<segs.length;i++){ if(segs[i].s<=t && t<segs[i].e){act=i;break;} }
+                            chips.forEach((c,i)=>{ const on=(+c.dataset.i===act);
+                            c.style.background=on?'#2563eb':'transparent'; c.style.color=on?'#fff':'#111'; });
+                            if(act>=0) chips[act].scrollIntoView({block:'nearest',behavior:'smooth'});
+                            tt.textContent=t.toFixed(2)+' / '+DUR.toFixed(2)+'s'; drawWave();
+                            if(!au.paused) requestAnimationFrame(tick);
+                        }
+                        pp.onclick=()=>{ au.paused?au.play():au.pause(); };
+                        au.onplay=()=>{pp.textContent='⏸ pause'; tick();};
+                        au.onpause=()=>{pp.textContent='▶ play';};
+                        au.onended=()=>{pp.textContent='▶ play';};
+                        sp.oninput=()=>{ au.playbackRate=+sp.value; spl.textContent=(+sp.value).toFixed(2)+'×'; };
+                        wf.onclick=e=>{ const r=wf.getBoundingClientRect(); const f=(e.clientX-r.left)/r.width;
+                            au.currentTime=view[0]+(view[1]-view[0])*f; if(au.paused) drawWave(); };
+                        wf.onwheel=e=>{ e.preventDefault(); const r=wf.getBoundingClientRect(); const f=(e.clientX-r.left)/r.width;
+                            const c=view[0]+(view[1]-view[0])*f, z=e.deltaY<0?0.8:1.25; let w=(view[1]-view[0])*z;
+                            w=Math.max(0.3,Math.min(DUR,w)); let a=c-f*w, b=a+w; a=Math.max(0,a); b=Math.min(DUR,a+w);
+                            view=[a,b]; drawWave(); };
+                        drawWave();
+                        })();
+                        </script>
+                        """
