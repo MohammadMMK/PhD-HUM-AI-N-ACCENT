@@ -475,7 +475,14 @@ def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row
                     .replace("__TITLE__", json.dumps(title or "")) \
                     .replace("__RULES__", json.dumps(rules_text))
     if out_html:
-        with open(out_html, "w", encoding="utf-8") as f: f.write(html)
+        out_dir = os.path.join(os.getcwd(), "outputs")
+        os.makedirs(out_dir, exist_ok=True)
+
+        full_path = os.path.join(out_dir, out_html)
+        print(f"Writing interactive HTML to: {full_path}")
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
     return html
 
 
