@@ -1,0 +1,29 @@
+---
+title: "Native stimuli from three new voices"
+format:
+  html:
+    embed-resources: true
+---
+
+## three new voices
+
+### 80%male, 20% female
+
+<audio controls src="male80-dur-fixed.wav">
+
+</audio>
+
+### 50%male, 50% female
+
+<audio controls src="male50-dur-fixed.wav">
+
+</audio>
+
+### 20%male, 80% female
+
+<audio controls src="male20-dur-fixed.wav">
+
+</audio>
+
+### the paragraph 
+Il mio viaggio nella Corea del Nord inizia con verdi viali di salici che delimitano strade a otto corsie dove transitano pochissime automobili, marciapiedi lindi e aiuole fiorite, quotidianamente curate da gruppi di cittadini volontari. È uno scenario unico fatto di architettura monumentale e celebrativa non imbrattata da cartelloni pubblicitari. Coreografiche manifestazioni di piazza ogni giorno in tutto il paese. Fiumi dalle acque limpide e pescose, pianure di campi di riso e mais, montagne tondeggianti ricoperte di boschi e interrotte da torrenti fruscianti. L’aria è pervasa da melodie delicate, Nessun cellulare che trilla irritante mentre cenate. In questo paese l’istruzione è gratuita, così come la sanità. Il sostentamento alimentare di base è garantito. I servizi essenziali come gas, luce e acqua hanno costi irrisori. La delinquenza è pressoché inesistente. Gli studenti del doposcuola imparano gratuitamente musica, pittura, ricamo e così via, mentre per gli adulti ci sono corsi di lingue e conferenze su ogni disciplina tecnico-scientifica. Le attività sportive fanno parte della vita quotidiana quanto il lavoro e i grandi centri urbani dispongono di ogni genere di impianto sportivo. Si tratta di un sogno, un’utopia? No: benvenuti nella Repubblica del Popolo Democratico di Corea. Sin dall’ingresso nel Paese dei Koryo, la Corea (dal nome della dinastia che governò sulla penisola coreana e che la unificò), ci si rende conto che non ci si trova in un posto qualunque, uno dei tanti "non luoghi" turistici, indistinguibili tra loro per il conformarsi allo standard del mercato. L’aeroporto internazionale di Pyongyang ti accoglie semivuoto, con pochi aerei fermi sulla pista. La breve attività quotidiana si concentra esclusivamente in coincidenza con il volo da e per Pechino. Le formalità sono rapide e i controlli brevi. La pattuglia degli ospiti stranieri è attesa, di loro si sa già tutto: per entrare nel paese è necessario richiedere per tempo un invito ufficiale, ottenibile tramite pochissime agenzie autorizzate previo acquisto di un pacchetto turistico. Il margine di manovra è limitatissimo, riducendosi in pratica alla durata del soggiorno (limitata a una dozzina di giorni al massimo) e alla scelta se visitare in gruppo o per conto proprio gli stessi posti, negli stessi orari. Ed è bene anche leggere tutte le avvertenze e i consigli per il viaggio, così non ci si sorprende quando in dogana vengono sequestrati i cellulari (che saranno poi restituiti all’uscita dal paese). Si ha la sensazione di star per entrare in un altro mondo, un mondo per l’appunto unico e complesso, certo non familiare: quando il mondo era diviso in due blocchi, chi visitava l’uno o l’altro poteva forse provare certe sensazioni.
