@@ -126,6 +126,13 @@ RULE KINDS
   palatalize  : append ʲ (164) to target consonants         (default targets: ALL consonants)
   nasal_final : append ̃  (17) to WORD-FINAL vowels          (default targets: ALL vowels)
   substitute  : replace phonemes via a map (old -> new)      (old/new may be a CHAR or a TOKEN ID)
+                `new` may itself be a multi-char string, e.g. "pʰ" or "tʲ", so you
+                can substitute one phoneme with the aspirated/palatalized form of
+                ANOTHER phoneme directly: {"old":"n","new":"pʰ"}.
+                Optional per-rule flags append the marker for you instead of typing
+                ʰ/ʲ by hand: aspirate=True appends ʰ, palatalize=True appends ʲ to
+                every value in the map. E.g. {"old":"n","new":"p","aspirate":True}
+                -> n becomes pʰ. Works with "map" (multiple pairs) too.
   retroflex   : preset map  t→ʈ d→ɖ n→ɳ s→ʂ r→ɽ
   japanese    : preset map  s→ɕ  ʃ→ɕ  tʃ/ʧ→ʨ  dʒ/ʤ→ʥ  p→ɸ
   spanish     : preset map  b→β  v→β  d→ð  ɡ→ɣ        (ɡ = U+0261, the script-g espeak emits)
@@ -288,6 +295,10 @@ def _apply_rule(s, rule, protect_affricates, in_mask=None):
         mapping = (rule["map"] if "map" in rule else {rule["old"]: rule["new"]}) \
                   if kind == "substitute" else PRESETS[kind]
         mapping = _norm_map(mapping)
+        if kind == "substitute":
+            suffix = ('ʰ' if rule.get("aspirate") else '') + ('ʲ' if rule.get("palatalize") else '')
+            if suffix:
+                mapping = {k: v + suffix for k, v in mapping.items()}
         return _scan(s, mapping.keys(), lambda k: mapping[k], scope, protect_affricates, in_mask)
 
     raise ValueError(f"unknown rule kind: {kind!r}")
@@ -323,6 +334,8 @@ def describe_rules(rules):
             lines.append(f"{kind}: " + ", ".join(f"{k}→{v}" for k, v in PRESETS[kind].items()) + sfx)
         elif kind == "substitute":
             mapping = r.get("map", {r.get("old"): r.get("new")})
+            suffix = ('ʰ' if r.get("aspirate") else '') + ('ʲ' if r.get("palatalize") else '')
+            mapping = {k: v + suffix for k, v in mapping.items()} if suffix else mapping
             lines.append("substitute: " + ", ".join(f"{k}→{v}" for k, v in mapping.items()) + sfx)
         elif kind == "nasal_final":
             t = r.get("targets")
