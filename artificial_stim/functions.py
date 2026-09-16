@@ -240,13 +240,41 @@ def _norm(x):
 def _norm_map(m):
     return {_norm(k): _norm(v) for k, v in m.items()}
 
+import random
+from collections import Counter
+
+# ---- probability helpers (for "substitute_prob") ------------------------------
+def _norm_choices(choices, suffix=""):
+    """choices: {out: weight} dict OR list of (out, weight) pairs.
+    Outputs may be chars, multi-char strings, or token ids. Weights can be
+    fractions (0.4) or percentages (40) — they are normalised to sum to 1.
+    Returns (outputs, weights)."""
+    items = list(choices.items()) if isinstance(choices, dict) else list(choices)
+    if not items:
+        raise ValueError("substitute_prob: empty choices")
+    outs, ws = [], []
+    for out, w in items:
+        if w < 0:
+            raise ValueError(f"substitute_prob: negative weight {w} for {out!r}")
+        outs.append(_norm(out) + suffix)
+        ws.append(float(w))
+    total = sum(ws)
+    if total <= 0:
+        raise ValueError("substitute_prob: weights sum to 0")
+    return outs, [w / total for w in ws]
+
 # ---- core scan: longest-match, guarded ----------------------------------------
-def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None):
+def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None, pass_pos=False):
     """Longest-match scan. `in_mask` (optional) is a bool list aligned to `s`,
     carrying forward alteration flags from earlier rules in the same
     manipulate() call. `guard` (optional) is a callable (s, start, end) -> bool;
     the rule only fires where it returns True — used for positional conditions
-    such as word-finality. Returns (output_string, out_mask)."""
+    such as word-finality. Returns (output_string, out_mask).
+    If the action returns the key unchanged (e.g. a probabilistic rule picked
+    the phoneme itself), the incoming mask is kept, so it is NOT flagged.
+    pass_pos=True: the action is called as action(key, s, i) instead of
+    action(key), so it can look at where the match is (used by substitute_prob
+    to keep geminates / repeated phonemes in a word consistent)."""
     if in_mask is None:
         in_mask = [False] * len(s)
     keys = sorted(set(keys), key=len, reverse=True)
@@ -264,16 +292,29 @@ def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None):
         if fire and guard is not None and not guard(s, i, end):
             fire = False                                   # positional condition failed
         if fire:
-            piece = action(key)
+            piece = action(key, s, i) if pass_pos else action(key)
             out.append(piece)
-            mask.extend([True] * len(piece))
+            if piece == key:
+                mask.extend(in_mask[i:end])                # unchanged -> keep previous flags
+            else:
+                mask.extend([True] * len(piece))
             i = end
         else:
             out.append(s[i]); mask.append(in_mask[i]); i += 1
     return ''.join(out), mask
 
 # ---- one rule -> one chunk ----------------------------------------------------
-def _apply_rule(s, rule, protect_affricates, in_mask=None):
+def _counted(action, counter):
+    """Wrap a _scan action so every firing is tallied as counter[(old, new)] += 1."""
+    if counter is None:
+        return action
+    def wrapped(k, *ctx):
+        piece = action(k, *ctx)
+        counter[(k, piece)] += 1
+        return piece
+    return wrapped
+
+def _apply_rule(s, rule, protect_affricates, in_mask=None, rng=None, counter=None):
     kind  = rule["kind"]
     scope = rule.get("scope", "all")
 
@@ -281,47 +322,163 @@ def _apply_rule(s, rule, protect_affricates, in_mask=None):
         default = VOICELESS_STOPS if kind == "aspirate" else CONSONANTS
         targets = {_norm(t) for t in rule.get("targets", default)}
         suffix  = 'ʰ' if kind == "aspirate" else 'ʲ'
-        return _scan(s, targets, lambda k: k + suffix, scope, protect_affricates, in_mask)
+        return _scan(s, targets, _counted(lambda k: k + suffix, counter),
+                     scope, protect_affricates, in_mask)
 
     if kind == "nasal_final":
         targets = {_norm(t) for t in rule.get("targets", VOWELS)}
         bad = targets - VOWELS
         if bad:
             raise ValueError(f"nasal_final targets must be vowels; got {sorted(bad)}")
-        return _scan(s, targets, lambda k: k + NASAL_TILDE, scope, protect_affricates,
-                     in_mask, guard=lambda st, a, b: _is_word_final(st, b))
+        return _scan(s, targets, _counted(lambda k: k + NASAL_TILDE, counter),
+                     scope, protect_affricates, in_mask,
+                     guard=lambda st, a, b: _is_word_final(st, b))
 
     if kind in PRESETS or kind == "substitute":
-        mapping = (rule["map"] if "map" in rule else {rule["old"]: rule["new"]}) \
-                  if kind == "substitute" else PRESETS[kind]
-        mapping = _norm_map(mapping)
-        if kind == "substitute":
-            suffix = ('ʰ' if rule.get("aspirate") else '') + ('ʲ' if rule.get("palatalize") else '')
-            if suffix:
-                mapping = {k: v + suffix for k, v in mapping.items()}
-        return _scan(s, mapping.keys(), lambda k: mapping[k], scope, protect_affricates, in_mask)
+        mapping = _rule_mapping(rule)
+        return _scan(s, mapping.keys(), _counted(lambda k: mapping[k], counter),
+                     scope, protect_affricates, in_mask)
+
+    if kind == "substitute_prob":
+        rng = rng or random.Random()
+        table = _rule_prob_table(rule)
+        same_geminate, same_in_word = _prob_flags(rule)
+        # word id of every position in this chunk (a boundary char starts a new word)
+        word_id, w = [], 0
+        for ch in s:
+            if ch in BOUNDARY:
+                w += 1
+            word_id.append(w)
+        last = {}          # key -> (end position, piece) of the previous firing of that key
+        word_pick = {}     # (word id, key) -> piece chosen for that phoneme in that word
+
+        def pick(k, st, i):
+            # 1) same_in_word: reuse the choice made for this phoneme earlier in the word
+            if same_in_word and (word_id[i], k) in word_pick:
+                piece = word_pick[(word_id[i], k)]
+            # 2) same_geminate: the previous firing of this key ends right before i
+            #    (only diacritics/stress marks in between) -> same choice
+            elif same_geminate and k in last and \
+                    all(c in SKIP for c in st[last[k][0]:i]):
+                piece = last[k][1]
+            # 3) otherwise: a fresh weighted random draw
+            else:
+                outs, ws = table[k]
+                piece = rng.choices(outs, weights=ws, k=1)[0]
+                if counter is not None:
+                    counter[("#draws", k)] += 1
+            last[k] = (i + len(k), piece)
+            word_pick[(word_id[i], k)] = piece
+            return piece
+
+        return _scan(s, table.keys(), _counted(pick, counter),
+                     scope, protect_affricates, in_mask, pass_pos=True)
 
     raise ValueError(f"unknown rule kind: {kind!r}")
 
+def _rule_mapping(rule):
+    """Deterministic {old: new} map for 'substitute' and preset rules."""
+    kind = rule["kind"]
+    if kind == "substitute":
+        mapping = _norm_map(rule["map"] if "map" in rule else {rule["old"]: rule["new"]})
+        suffix = ('ʰ' if rule.get("aspirate") else '') + ('ʲ' if rule.get("palatalize") else '')
+        return {k: v + suffix for k, v in mapping.items()} if suffix else mapping
+    return _norm_map(PRESETS[kind])
+
+def _rule_prob_table(rule):
+    """{old: (outputs, weights)} for 'substitute_prob' rules."""
+    raw = rule["map"] if "map" in rule else {rule["old"]: rule["choices"]}
+    suffix = ('ʰ' if rule.get("aspirate") else '') + ('ʲ' if rule.get("palatalize") else '')
+    return {_norm(k): _norm_choices(ch, suffix) for k, ch in raw.items()}
+
+def _prob_flags(rule):
+    """(same_geminate, same_in_word) for a 'substitute_prob' rule.
+    same_geminate (default True) : tt, kk ... always get ONE choice for both halves.
+    same_in_word  (default False): every occurrence of the phoneme in a word reuses
+                                   the first choice made in that word."""
+    return bool(rule.get("same_geminate", True)), bool(rule.get("same_in_word", False))
+
+# ---- substitution statistics (for the HTML legend) ----------------------------
+def _build_stats(rules, counters):
+    """Turn per-rule Counters {(old, new): n} into a JSON-friendly list:
+    [{"label", "kind", "changed", "groups": [{"old", "total",
+      "rows": [{"new", "n", "p" (target prob or None), "changed"}]}]}]
+    Deterministic and probabilistic substitutions list every option, even at 0,
+    so you can see when a mapping never fired."""
+    out = []
+    for rule, cnt in zip(rules, counters):
+        kind = rule["kind"]
+        groups = {}                                        # old -> list of rows
+        draws  = {}                                        # old -> independent random draws
+        if kind == "substitute_prob":
+            for old, (outs, ws) in _rule_prob_table(rule).items():
+                groups[old] = [{"new": o, "n": cnt.get((old, o), 0), "p": w, "changed": o != old}
+                               for o, w in zip(outs, ws)]
+                draws[old] = cnt.get(("#draws", old), 0)
+        elif kind in PRESETS or kind == "substitute":
+            for old, new in _rule_mapping(rule).items():
+                groups[old] = [{"new": new, "n": cnt.get((old, new), 0), "p": None, "changed": new != old}]
+        else:                                              # aspirate / palatalize / nasal_final: only hits
+            for (old, new), n in sorted(cnt.items(), key=lambda kv: -kv[1]):
+                if old == "#draws":
+                    continue
+                groups.setdefault(old, []).append({"new": new, "n": n, "p": None, "changed": new != old})
+        gl = [{"old": old, "total": sum(r["n"] for r in rows), "rows": rows,
+               "draws": draws.get(old)} for old, rows in groups.items()]
+        out.append({
+            "label":   describe_rules([rule]),
+            "kind":    kind,
+            "changed": sum(r["n"] for g in gl for r in g["rows"] if r["changed"]),
+            "groups":  gl,
+        })
+    return out
+
+def print_stats(stats):
+    """Quick text view of manipulate(..., return_stats=True) output."""
+    for i, r in enumerate(stats, 1):
+        print(f"rule {i}: {r['label']}   ({r['changed']} changes)")
+        for g in r["groups"]:
+            if g.get("draws") is not None:
+                print(f"    {g['old']}: {g['total']} occurrences, {g['draws']} random draws")
+            for row in g["rows"]:
+                pct = f"{100*row['n']/g['total']:.0f}%" if g["total"] else "–"
+                tgt = f" (target {100*row['p']:.0f}%)" if row["p"] is not None else ""
+                print(f"    {g['old']} → {row['new']}: {row['n']}  {pct}{tgt}")
+
 # ---- public entry point -------------------------------------------------------
-def manipulate(ipa, rules, protect_affricates=True, return_mask=False):
+def manipulate(ipa, rules, protect_affricates=True, return_mask=False, seed=None,
+               return_stats=False):
     """ipa: str or list of chunks. rules: list of rule dicts, applied IN ORDER.
-    return_mask=False (default): identical behavior to before — returns just
-    the manipulated string (or list of strings).
-    return_mask=True: also returns a parallel bool mask (or list of masks)
-    marking every character that any rule altered or introduced."""
+    return_mask=True : also return a parallel bool mask (or list of masks)
+                       marking every character that any rule altered or introduced.
+    return_stats=True: also return per-rule substitution counts (pass them to
+                       audiovisualize_interactive(stats=...) for the legend).
+    Return order: result, [mask], [stats].
+    seed: int for reproducible "substitute_prob" draws (None = different every run).
+    A rule can also carry its own "seed" key, which overrides this for that rule.
+    substitute_prob options: same_geminate=True (default) -> both halves of tt/kk
+    get one choice; same_in_word=False (default) -> set True so every occurrence
+    of the phoneme within a word reuses the first choice made in that word.
+    Note: counts are what each rule did when it ran; a later rule can still
+    transform the output of an earlier one (e.g. t→d then d→ð)."""
     single = isinstance(ipa, str)
     chunks = [ipa] if single else list(ipa)
+    base_rng = random.Random(seed)
+    rule_rngs = [random.Random(r["seed"]) if "seed" in r else base_rng for r in rules]
+    counters = [Counter() for _ in rules]
     out_strs, out_masks = [], []
     for s in chunks:
         mask = [False] * len(s)
-        for rule in rules:
-            s, mask = _apply_rule(s, rule, protect_affricates, mask)
+        for rule, rng, cnt in zip(rules, rule_rngs, counters):
+            s, mask = _apply_rule(s, rule, protect_affricates, mask, rng, cnt)
         out_strs.append(s)
         out_masks.append(mask)
+    result = [out_strs[0] if single else out_strs]
     if return_mask:
-        return (out_strs[0], out_masks[0]) if single else (out_strs, out_masks)
-    return out_strs[0] if single else out_strs
+        result.append(out_masks[0] if single else out_masks)
+    if return_stats:
+        result.append(_build_stats(rules, counters))
+    return result[0] if len(result) == 1 else tuple(result)
 
 # ---- human-readable rule description (for the HTML header) --------------------
 def describe_rules(rules):
@@ -337,6 +494,19 @@ def describe_rules(rules):
             suffix = ('ʰ' if r.get("aspirate") else '') + ('ʲ' if r.get("palatalize") else '')
             mapping = {k: v + suffix for k, v in mapping.items()} if suffix else mapping
             lines.append("substitute: " + ", ".join(f"{k}→{v}" for k, v in mapping.items()) + sfx)
+        elif kind == "substitute_prob":
+            raw = r.get("map", {r.get("old"): r.get("choices")})
+            suffix = ('ʰ' if r.get("aspirate") else '') + ('ʲ' if r.get("palatalize") else '')
+            parts = []
+            for k, ch in raw.items():
+                outs, ws = _norm_choices(ch, suffix)
+                opts = " | ".join(f"{o} {w*100:.0f}%" for o, w in zip(outs, ws))
+                parts.append(f"{_norm(k)}→{{{opts}}}")
+            gem, word = _prob_flags(r)
+            flags = [f for f, on in (("same in word", word), ("same geminate", gem and not word)) if on]
+            if not gem and not word:
+                flags.append("independent")
+            lines.append("substitute_prob: " + ", ".join(parts) + f" [{', '.join(flags)}]" + sfx)
         elif kind == "nasal_final":
             t = r.get("targets")
             which = "all vowels" if t is None else "".join(sorted(_norm(x) for x in t))
@@ -443,8 +613,11 @@ def synth_aligned(ipa_chunks, voice, speed=1.0, sr=SR, masks=None):
 
 def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row=None,
                                 seg_words=None, text=None, seg_altered=None,
-                                title=None, rules=None):
+                                title=None, rules=None, stats=None):
     """title (optional): short heading shown at the top of the player.
+    stats (optional): from manipulate(..., return_stats=True). Renders a legend
+    with the number of changes for each substitution (and actual vs target %
+    for substitute_prob rules).
     rules (optional): the same `rules` list you passed to manipulate() — it's
     turned into a one-line human-readable summary and shown under the title.
     Falls back gracefully (rule kinds only) if describe_rules() isn't in
@@ -486,7 +659,8 @@ def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row
     html = _TEMPLATE.replace("__B64__", b64).replace("__SEGS__", json.dumps(segs)) \
                     .replace("__ENV__", json.dumps(env)).replace("__DUR__", str(dur)) \
                     .replace("__TITLE__", json.dumps(title or "")) \
-                    .replace("__RULES__", json.dumps(rules_text))
+                    .replace("__RULES__", json.dumps(rules_text)) \
+                    .replace("__STATS__", json.dumps(stats or []))
     if out_html:
         out_dir = os.path.join(os.getcwd(), "outputs")
         os.makedirs(out_dir, exist_ok=True)
@@ -503,6 +677,10 @@ _TEMPLATE = r"""
 <div id="pv" style="font-family:system-ui,sans-serif;max-width:1080px">
 <h2 id="pageTitle" style="margin:0 0 4px;font-size:20px;font-weight:700;color:#111;"></h2>
 <div id="rulesBox" style="font-size:12.5px;color:#555;margin-bottom:12px;padding:7px 11px;background:#f3f4f6;border-radius:6px;display:none;max-height:60px;overflow-y:auto;"></div>
+<div id="statsBox" style="display:none;margin:0 0 12px;padding:9px 12px;border:1px solid #e5e7eb;border-radius:8px;background:#fffdf7;font-size:13px;color:#333;">
+    <div style="font-weight:700;margin-bottom:6px;color:#111;">Substitutions <span id="statsTotal" style="font-weight:400;color:#666;"></span></div>
+    <div id="statsBody"></div>
+</div>
 <audio id="au" src="data:audio/wav;base64,__B64__"></audio>
 <div style="display:flex;gap:8px;align-items:center;margin-bottom:2px">
     <button id="pp" style="padding:6px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer">▶ play</button>
@@ -520,7 +698,7 @@ _TEMPLATE = r"""
 <script>
 (function(){
 const segs=__SEGS__, env=__ENV__, DUR=__DUR__;
-const TITLE=__TITLE__, RULES=__RULES__;
+const TITLE=__TITLE__, RULES=__RULES__, STATS=__STATS__;
 const au=document.getElementById('au'), pp=document.getElementById('pp');
 const ph=document.getElementById('ph'), wf=document.getElementById('wf'), ctx=wf.getContext('2d');
 const tt=document.getElementById('tt'), sp=document.getElementById('sp'), spl=document.getElementById('spl');
@@ -535,6 +713,58 @@ if (RULES) {
 }
 
 if (segs.some(g=>g.alt)) legend.style.display='block';
+
+// ---- substitution-count legend ----
+if (STATS && STATS.length) {
+    const box=document.getElementById('statsBox'), body=document.getElementById('statsBody');
+    const el=(tag,css,txt)=>{ const e=document.createElement(tag); if(css) e.style.cssText=css; if(txt!==undefined) e.textContent=txt; return e; };
+    let grand=0;
+    STATS.forEach((r,ri)=>{
+        grand+=r.changed;
+        const blk=el('div', 'margin:0 0 8px;' + (ri ? 'padding-top:7px;border-top:1px dashed #e5e7eb;' : ''));
+        const head=el('div','font-size:12px;color:#555;margin-bottom:3px;');
+        head.appendChild(el('b','color:#111;', 'Rule '+(ri+1)+': '));
+        head.appendChild(document.createTextNode(r.label+'  '));
+        head.appendChild(el('span','color:#b45309;font-weight:700;', '('+r.changed+' change'+(r.changed===1?'':'s')+')'));
+        blk.appendChild(head);
+        if (!r.groups.length) blk.appendChild(el('div','color:#999;font-size:12px;margin-left:12px;','no matches'));
+        const isProb = r.kind==='substitute_prob';
+        let shared=null;                                   // deterministic rules: all chips on one line
+        r.groups.forEach(g=>{
+            const row = (!isProb && shared) ? shared
+                      : el('div','display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:3px 0 3px 12px;');
+            if (!isProb) shared=row;
+            if (isProb) {
+                const lab = el('span','font-size:12px;color:#666;min-width:64px;', g.old+' ×'+g.total);
+                if (g.draws !== null && g.draws !== undefined && g.draws !== g.total) {
+                    lab.textContent += ' ('+g.draws+' draw'+(g.draws===1?'':'s')+')';
+                    lab.title = 'geminates / repeats in a word reused an earlier choice, so there were fewer independent random draws than occurrences';
+                }
+                row.appendChild(lab);
+            }
+            g.rows.forEach(o=>{
+                const pct = g.total ? Math.round(100*o.n/g.total) : 0;
+                const chip=el('span','display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;'
+                    + (o.changed ? 'background:#fef3c7;border:1px solid #fcd34d;' : 'background:#f3f4f6;border:1px solid #e5e7eb;'));
+                chip.appendChild(el('span','font-size:16px;', g.old+' → '+o.new));
+                chip.appendChild(el('b', o.changed ? 'color:#b45309;' : 'color:#555;', String(o.n)));
+                if (o.p !== null) {
+                    chip.appendChild(el('span','font-size:11px;color:#666;', pct+'% (target '+Math.round(100*o.p)+'%)'));
+                    const bar=el('span','display:inline-block;width:46px;height:6px;background:#e5e7eb;border-radius:3px;position:relative;overflow:hidden;');
+                    bar.appendChild(el('span','position:absolute;left:0;top:0;bottom:0;width:'+pct+'%;background:'+(o.changed?'#f59e0b':'#9ca3af')+';'));
+                    bar.appendChild(el('span','position:absolute;top:0;bottom:0;width:2px;background:#111;left:calc('+Math.round(100*o.p)+'% - 1px);'));
+                    chip.appendChild(bar);
+                }
+                if (!o.changed) chip.title='kept as itself (not highlighted)';
+                row.appendChild(chip);
+            });
+            if (!row.parentNode) blk.appendChild(row);
+        });
+        body.appendChild(blk);
+    });
+    document.getElementById('statsTotal').textContent='— '+grand+' change'+(grand===1?'':'s')+' in total';
+    box.style.display='block';
+}
 let groups=[];
 if (segs.length && segs[0].w !== undefined) {
     segs.forEach((g,i)=>{
@@ -594,8 +824,7 @@ function tick(){ const t=au.currentTime; let act=-1;
     wordWraps.forEach(w=>{ w.style.borderColor='#e5e7eb'; w.style.background='#f8f9fb'; });
     if (act>=0){
         const wrap=chips[act].closest('[data-gi]');
-        if (wrap){ wrap.style.borderColor='#2563eb'; wrap.style.background='#eef2ff';
-            wrap.scrollIntoView({block:'nearest',inline:'nearest',behavior:'smooth'}); }
+        if (wrap){ wrap.style.borderColor='#2563eb'; wrap.style.background='#eef2ff'; }
     }
     tt.textContent=t.toFixed(2)+' / '+DUR.toFixed(2)+'s'; drawWave();
     if(!au.paused) requestAnimationFrame(tick);
