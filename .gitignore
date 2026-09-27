@@ -1,7 +1,7 @@
 Artificial Accent/.env
 archive/
-custom_voices/
+# custom_voices/
 kokoro_model/
-outputs/
+output_local/
 Artificial Accent/test.ipynb
 Artificial Accent/accents_rules.ipynbartificial_stim/.env

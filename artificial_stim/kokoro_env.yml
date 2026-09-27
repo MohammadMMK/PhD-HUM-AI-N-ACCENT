@@ -1,0 +1,20 @@
+# Clean, isolated environment for Kokoro-82M (Italian) + your functions.py
+# Windows, CPU only.
+# Create with:   conda env create -f kokoro_env.yml
+name: kokoro
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11          # kokoro 0.9.4 needs >=3.10,<3.14 (the README's 3.9 is outdated)
+  - pip
+  - pip:
+      - torch             # CPU build installs automatically on Windows via plain pip
+      - kokoro==0.9.4
+      - misaki[en]==0.9.4
+      - transformers>=4.45,<5   # kokoro was written against transformers 4.x
+      - huggingface_hub
+      - soundfile
+      - ipykernel
+      - ipython
+      - pandas
+      - matplotlib

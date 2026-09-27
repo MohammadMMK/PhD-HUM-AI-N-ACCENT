@@ -178,7 +178,8 @@ INV = {v: k for k, v in VOCAB.items()}                     # token id -> char
 
 # ---- phoneme classes ----------------------------------------------------------
 VOWELS = set('aeiouy') | set('ɑɐɒæɔəɚɛɜɨɪɯøœʊʌɤ') | {'\u1d7b','\u1d4a'} | set('AIOQWY')
-CONSONANTS = set('bcdfhjklmnpqrstvwxz') | set('βɕçɖðʤɟɡɥʝɰŋɳɲɴɸθɹɾɻʁɽʂʃʈʧʋɣχʎʒʔ') | set('ʣʥʦʨꭧ')
+CONSONANTS = set('bcdfhjklmnpqrstvwxz') | set('βɕçɖðʤɟɡɥʝɰŋɳɲɴɸθɹɾɻʁɽʂʃʈʧʋɣχʎʒʔ') | set('ʣʥʦʨꭧ') \
+             | {'S'}   # misaki writes geminate ss as ONE token 'S' (e.g. complessa -> komplˈeSa)
 SKIP     = {'ˈ','ˌ','ː','ʰ','ʲ','\u0303','\u1d5d','↓','→','↗','↘'}
 BOUNDARY = {' ',';',':',',','.','!','?','\u2014','\u2026','"','(',')','\u201c','\u201d'}
 AFFRICATE_PAIRS = {('t','ʃ'), ('t','s'), ('d','ʒ'), ('d','z')}
@@ -264,7 +265,8 @@ def _norm_choices(choices, suffix=""):
     return outs, [w / total for w in ws]
 
 # ---- core scan: longest-match, guarded ----------------------------------------
-def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None, pass_pos=False):
+def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None, pass_pos=False,
+          in_origin=None):
     """Longest-match scan. `in_mask` (optional) is a bool list aligned to `s`,
     carrying forward alteration flags from earlier rules in the same
     manipulate() call. `guard` (optional) is a callable (s, start, end) -> bool;
@@ -274,15 +276,21 @@ def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None, 
     the phoneme itself), the incoming mask is kept, so it is NOT flagged.
     pass_pos=True: the action is called as action(key, s, i) instead of
     action(key), so it can look at where the match is (used by substitute_prob
-    to keep geminates / repeated phonemes in a word consistent)."""
+    to keep geminates / repeated phonemes in a word consistent).
+    `in_origin` (optional) is a list aligned to `s` of (start, end) spans into
+    the ORIGINAL chunk; every output char gets the span it came from. All chars
+    of a replacement piece share the union span of the chars they replaced
+    (k -> kʲ: both k and ʲ point at the original k). Returns (out, mask, origin)."""
     if in_mask is None:
         in_mask = [False] * len(s)
+    if in_origin is None:
+        in_origin = [(j, j + 1) for j in range(len(s))]
     keys = sorted(set(keys), key=len, reverse=True)
-    out, mask, i, n = [], [], 0, len(s)
+    out, mask, origin, i, n = [], [], [], 0, len(s)
     while i < n:
         key = next((k for k in keys if s.startswith(k, i)), None)
         if key is None:
-            out.append(s[i]); mask.append(in_mask[i]); i += 1; continue
+            out.append(s[i]); mask.append(in_mask[i]); origin.append(in_origin[i]); i += 1; continue
         end = i + len(key)
         fire = True
         if len(key) == 1 and protect_affricates and _is_affricate_member(s, i):
@@ -296,12 +304,16 @@ def _scan(s, keys, action, scope, protect_affricates, in_mask=None, guard=None, 
             out.append(piece)
             if piece == key:
                 mask.extend(in_mask[i:end])                # unchanged -> keep previous flags
+                origin.extend(in_origin[i:end])
             else:
                 mask.extend([True] * len(piece))
+                src = in_origin[i:end]
+                span = (min(a for a, _ in src), max(b for _, b in src))
+                origin.extend([span] * len(piece))         # whole piece inherits the replaced span
             i = end
         else:
-            out.append(s[i]); mask.append(in_mask[i]); i += 1
-    return ''.join(out), mask
+            out.append(s[i]); mask.append(in_mask[i]); origin.append(in_origin[i]); i += 1
+    return ''.join(out), mask, origin
 
 # ---- one rule -> one chunk ----------------------------------------------------
 def _counted(action, counter):
@@ -314,7 +326,7 @@ def _counted(action, counter):
         return piece
     return wrapped
 
-def _apply_rule(s, rule, protect_affricates, in_mask=None, rng=None, counter=None):
+def _apply_rule(s, rule, protect_affricates, in_mask=None, rng=None, counter=None, in_origin=None):
     kind  = rule["kind"]
     scope = rule.get("scope", "all")
 
@@ -323,7 +335,7 @@ def _apply_rule(s, rule, protect_affricates, in_mask=None, rng=None, counter=Non
         targets = {_norm(t) for t in rule.get("targets", default)}
         suffix  = 'ʰ' if kind == "aspirate" else 'ʲ'
         return _scan(s, targets, _counted(lambda k: k + suffix, counter),
-                     scope, protect_affricates, in_mask)
+                     scope, protect_affricates, in_mask, in_origin=in_origin)
 
     if kind == "nasal_final":
         targets = {_norm(t) for t in rule.get("targets", VOWELS)}
@@ -332,12 +344,12 @@ def _apply_rule(s, rule, protect_affricates, in_mask=None, rng=None, counter=Non
             raise ValueError(f"nasal_final targets must be vowels; got {sorted(bad)}")
         return _scan(s, targets, _counted(lambda k: k + NASAL_TILDE, counter),
                      scope, protect_affricates, in_mask,
-                     guard=lambda st, a, b: _is_word_final(st, b))
+                     guard=lambda st, a, b: _is_word_final(st, b), in_origin=in_origin)
 
     if kind in PRESETS or kind == "substitute":
         mapping = _rule_mapping(rule)
         return _scan(s, mapping.keys(), _counted(lambda k: mapping[k], counter),
-                     scope, protect_affricates, in_mask)
+                     scope, protect_affricates, in_mask, in_origin=in_origin)
 
     if kind == "substitute_prob":
         rng = rng or random.Random()
@@ -372,7 +384,7 @@ def _apply_rule(s, rule, protect_affricates, in_mask=None, rng=None, counter=Non
             return piece
 
         return _scan(s, table.keys(), _counted(pick, counter),
-                     scope, protect_affricates, in_mask, pass_pos=True)
+                     scope, protect_affricates, in_mask, pass_pos=True, in_origin=in_origin)
 
     raise ValueError(f"unknown rule kind: {kind!r}")
 
@@ -447,13 +459,17 @@ def print_stats(stats):
 
 # ---- public entry point -------------------------------------------------------
 def manipulate(ipa, rules, protect_affricates=True, return_mask=False, seed=None,
-               return_stats=False):
+               return_stats=False, return_origin=False):
     """ipa: str or list of chunks. rules: list of rule dicts, applied IN ORDER.
     return_mask=True : also return a parallel bool mask (or list of masks)
                        marking every character that any rule altered or introduced.
     return_stats=True: also return per-rule substitution counts (pass them to
                        audiovisualize_interactive(stats=...) for the legend).
-    Return order: result, [mask], [stats].
+    return_origin=True: also return, per chunk, a list aligned to the output
+                       string of (start, end) spans into the ORIGINAL chunk.
+                       Pass it to synth_aligned(origins=...) to transfer the
+                       durations of the original text onto the manipulated one.
+    Return order: result, [mask], [stats], [origin].
     seed: int for reproducible "substitute_prob" draws (None = different every run).
     A rule can also carry its own "seed" key, which overrides this for that rule.
     substitute_prob options: same_geminate=True (default) -> both halves of tt/kk
@@ -466,18 +482,22 @@ def manipulate(ipa, rules, protect_affricates=True, return_mask=False, seed=None
     base_rng = random.Random(seed)
     rule_rngs = [random.Random(r["seed"]) if "seed" in r else base_rng for r in rules]
     counters = [Counter() for _ in rules]
-    out_strs, out_masks = [], []
+    out_strs, out_masks, out_origins = [], [], []
     for s in chunks:
         mask = [False] * len(s)
+        origin = [(j, j + 1) for j in range(len(s))]
         for rule, rng, cnt in zip(rules, rule_rngs, counters):
-            s, mask = _apply_rule(s, rule, protect_affricates, mask, rng, cnt)
+            s, mask, origin = _apply_rule(s, rule, protect_affricates, mask, rng, cnt, origin)
         out_strs.append(s)
         out_masks.append(mask)
+        out_origins.append(origin)
     result = [out_strs[0] if single else out_strs]
     if return_mask:
         result.append(out_masks[0] if single else out_masks)
     if return_stats:
         result.append(_build_stats(rules, counters))
+    if return_origin:
+        result.append(out_origins[0] if single else out_origins)
     return result[0] if len(result) == 1 else tuple(result)
 
 # ---- human-readable rule description (for the HTML header) --------------------
@@ -539,6 +559,7 @@ def describe_rules(rules):
 import numpy as np
 import base64, io, json, soundfile as sf
 from IPython.display import HTML
+from html import escape as _html_escape
 
 SR = 24000
 FRAME_SAMPLES = 600
@@ -547,11 +568,35 @@ TRAILING = {'ː','ʰ','ʲ','\u0303','\u1d5d','↓','→','↗','↘'}
 LEADING  = {'ˈ','ˌ'}
 
 
+# how misaki's single-letter tokens are shown in the player (the IPA string is unchanged)
+LABEL_DISPLAY = {'S': 'sː', 'A': 'eɪ', 'I': 'aɪ', 'W': 'aʊ', 'O': 'oʊ', 'Q': 'əʊ', 'Y': 'ɔɪ', ' ': '␣'}
+
+
+def token_kind(c):
+    """Visual category of one Kokoro token."""
+    if c == ' ':        return 'space'
+    if c in BASE:       return 'phone'
+    if c in TRAILING:   return 'diacritic'
+    if c in LEADING:    return 'stress'
+    return 'punct'
+
+
 def align_phonemes(phonemes, pred_dur, n_samples=None, sr=SR, lead_trim_frames=0, altered_mask=None):
-    """altered_mask (optional): bool list the same length as `phonemes`, e.g.
-    from manipulate(..., return_mask=True). If given, each emitted segment
-    gets an `altered` flag (True if any character contributing to it — base
-    or a merged trailing diacritic — was flagged)."""
+    """One segment per Kokoro token — nothing merged, nothing hidden.
+
+    Every token the model received gets its own segment with its own predicted
+    duration: phonemes, diacritics (ʲ ʰ ː ...), stress marks (ˈ ˌ), spaces,
+    punctuation, and the BOS/EOS tokens Kokoro adds around each chunk.
+    So dʲ is two segments, d and ʲ, each with its own duration.
+
+    altered_mask (optional): bool list the same length as `phonemes`, from
+    manipulate(..., return_mask=True).
+    Returns (segments, seg_word_idx, seg_altered):
+      segments     : [(token, start_s, end_s, info)], info = {"kind", "fr", "ms"}
+                     kind in phone / diacritic / stress / punct / space / bos / eos
+      seg_word_idx : word index per token; None for space / bos / eos
+                     (punctuation belongs to the word it is attached to)
+      seg_altered  : True where a manipulation rule changed/introduced the token"""
     kept, kept_altered = [], []
     for idx, c in enumerate(phonemes):
         if c in VOCAB:
@@ -562,51 +607,257 @@ def align_phonemes(phonemes, pred_dur, n_samples=None, sr=SR, lead_trim_frames=0
         f"pred_dur ({len(dur)}) != kept phonemes+2 ({len(kept)+2}) — filtered string mismatch"
     spf = (n_samples / sum(dur)) if n_samples else FRAME_SAMPLES
     f2s = lambda f: max(0.0, f - lead_trim_frames) * spf / sr
+    f2ms = lambda f: round(f * spf / sr * 1000, 1)
     start_f, acc = [], 0
     for d in dur:
         start_f.append(acc); acc += d
-    segs, pending, pending_altered = [], None, False
+
+    segs, seg_word_idx, seg_altered = [], [], []
+    def add(tok, k, kind, w, alt):
+        segs.append((tok, f2s(start_f[k]), f2s(start_f[k] + dur[k]),
+                     {"kind": kind, "fr": dur[k], "ms": f2ms(dur[k])}))
+        seg_word_idx.append(w); seg_altered.append(alt)
+
+    add('BOS', 0, 'bos', None, False)
     word_idx = 0
-    seg_word_idx, seg_altered = [], []
     for k, c in enumerate(kept, start=1):
-        s, e = start_f[k], start_f[k] + dur[k]
-        c_alt = kept_altered[k - 1]
-        if c in BASE:
-            segs.append([c, pending if pending is not None else s, e])
-            seg_word_idx.append(word_idx)
-            seg_altered.append(c_alt or pending_altered)
-            pending, pending_altered = None, False
-        elif c in TRAILING and segs:
-            segs[-1][0] += c; segs[-1][2] = e
-            if c_alt:
-                seg_altered[-1] = True
-        elif c in LEADING:
-            pending = s if pending is None else pending
-            pending_altered = pending_altered or c_alt
+        kind = token_kind(c)
+        if kind == 'space':
+            add(c, k, kind, None, kept_altered[k - 1])
+            word_idx += 1
         else:
-            pending, pending_altered = None, False
-            if c == ' ':
-                word_idx += 1
-    return [(lab, f2s(s), f2s(e)) for lab, s, e in segs], seg_word_idx, seg_altered
+            add(c, k, kind, word_idx, kept_altered[k - 1])
+    add('EOS', len(dur) - 1, 'eos', None, False)
+    return segs, seg_word_idx, seg_altered
 
 
-def synth_aligned(ipa_chunks, voice, speed=1.0, sr=SR, masks=None):
-    """masks (optional): list parallel to ipa_chunks, each entry the bool
-    mask for that chunk from manipulate(..., return_mask=True)."""
+def transfer_durations(orig_ps, manip_ps, origin, ref_dur, diacritic_weight=0.3):
+    """Map per-token durations of the ORIGINAL chunk onto the MANIPULATED chunk.
+
+    orig_ps  : original IPA string (what the reference voice spoke)
+    manip_ps : manipulated IPA string
+    origin   : from manipulate(..., return_origin=True) for this chunk
+               (None = identity, i.e. manip_ps == orig_ps)
+    ref_dur  : reference pred_dur (frames), len = kept(orig_ps) + 2 (BOS/EOS)
+
+    Each group of manipulated tokens that replaced a group of original tokens
+    gets EXACTLY the frames of what it replaced (k=5 -> kʲ = 4+1, total 5), so
+    every word boundary stays locked to the reference timing.
+    Inside a group, frames are split by weight: base phonemes 1.0, diacritics
+    (ʲ ʰ ː ̃ ˈ ...) `diacritic_weight`. Every token gets >= 1 frame when the
+    group has enough frames; otherwise diacritics may get 0 so the total holds.
+    Returns a list of ints, len = kept(manip_ps) + 2, sum == sum(ref_dur)."""
+    ref_dur = [int(x) for x in ref_dur]
+    if origin is None:
+        assert manip_ps == orig_ps, "origin=None requires identical strings"
+        origin = [(j, j + 1) for j in range(len(orig_ps))]
+    assert len(origin) == len(manip_ps), (len(origin), len(manip_ps))
+
+    # frames of every ORIGINAL char (0 for chars the model drops)
+    src_dur, k = [0] * len(orig_ps), 1
+    for j, c in enumerate(orig_ps):
+        if c in VOCAB:
+            src_dur[j] = ref_dur[k]; k += 1
+    assert k == len(ref_dur) - 1, \
+        f"ref pred_dur ({len(ref_dur)}) != kept original tokens+2 ({k + 1})"
+
+    # group consecutive manipulated chars whose source spans overlap
+    groups = []                                            # [a, b, [out idx]]
+    for oi, (a, b) in enumerate(origin):
+        if groups and a < groups[-1][1]:
+            groups[-1][1] = max(groups[-1][1], b); groups[-1][2].append(oi)
+        else:
+            assert not groups or a >= groups[-1][1], "non-monotonic origin"
+            groups.append([a, b, [oi]])
+    # deleted source chars (substitution to '') -> give their frames to the previous group
+    if groups:
+        groups[0][0] = 0
+        for g, nxt in zip(groups, groups[1:]):
+            g[1] = nxt[0]
+        groups[-1][1] = len(orig_ps)
+
+    def weight(c):
+        return diacritic_weight if (c in TRAILING or c in LEADING) else 1.0
+
+    new, carry, last_slot = [], 0, None
+    for a, b, outs in groups:
+        total = sum(src_dur[a:b]) + carry
+        kept = [oi for oi in outs if manip_ps[oi] in VOCAB]
+        if not kept:                                       # nothing audible here -> pass frames on
+            carry = total; continue
+        carry = 0
+        w = [weight(manip_ps[oi]) for oi in kept]
+        ideal = [total * x / sum(w) for x in w]
+        alloc = [int(v) for v in ideal]
+        rest = total - sum(alloc)                          # largest remainder
+        for j in sorted(range(len(kept)), key=lambda j: ideal[j] - alloc[j], reverse=True)[:rest]:
+            alloc[j] += 1
+        if total >= len(kept):                             # Kokoro never predicts 0: avoid zeros if possible
+            for j in range(len(alloc)):
+                if alloc[j] == 0:
+                    donor = max(range(len(alloc)), key=lambda q: alloc[q])
+                    alloc[donor] -= 1; alloc[j] += 1
+        last_slot = len(new) + len(alloc) - 1
+        new += alloc
+    if carry and last_slot is not None:
+        new[last_slot] += carry
+    out = [ref_dur[0]] + new + [ref_dur[-1]]
+    assert sum(out) == sum(ref_dur), (sum(out), sum(ref_dur))
+    return out
+
+
+# ---- cached, decoder-free duration prediction + forced synthesis -------------
+# Kokoro splits into: text encoders (depend only on the phoneme string),
+# duration predictor (string + voice), decoder (string + voice + durations,
+# by far the most expensive). Each stage is cached on exactly what it depends
+# on, so nothing is computed twice across versions/voices in one session:
+#   _ENC_CACHE   [ps]                    -> BERT + text-encoder outputs
+#   _DUR_CACHE   [(voice, ps, speed)]    -> predicted durations (no decoder run)
+#   _AUDIO_CACHE [(voice, ps, durations)]-> synthesized chunk audio
+# A chunk that is identical in two versions (same string, same timing) is
+# therefore synthesized once and is bit-identical in both files.
+import hashlib
+_ENC_CACHE, _DUR_CACHE, _AUDIO_CACHE = {}, {}, {}
+
+
+def clear_synth_cache():
+    """Free all cached encoder outputs, durations and chunk audio."""
+    _ENC_CACHE.clear(); _DUR_CACHE.clear(); _AUDIO_CACHE.clear()
+
+
+def _voice_pack(voice):
+    """-> (voice pack on the model device, stable cache key).
+    `voice` can be a tensor (e.g. torch.load('custom_voices/x.pt')) or a name."""
+    pack = voice if torch.is_tensor(voice) else gen.load_voice(voice)
+    if torch.is_tensor(voice):
+        key = "sha1:" + hashlib.sha1(voice.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()
+    else:
+        key = "name:" + str(voice)
+    return pack.to(model.device), key
+
+
+@torch.no_grad()
+def _encode(ps):
+    """Voice-independent part of KModel.forward_with_tokens, cached per string."""
+    enc = _ENC_CACHE.get(ps)
+    if enc is not None:
+        return enc
+    dev = model.device
+    ids = [i for i in (model.vocab.get(p) for p in ps) if i is not None]
+    assert len(ids) + 2 <= getattr(model, "context_length", 512), f"chunk too long ({len(ids)} tokens)"
+    input_ids = torch.LongTensor([[0, *ids, 0]]).to(dev)
+    L = torch.full((1,), input_ids.shape[-1], device=dev, dtype=torch.long)
+    tm = torch.gt(torch.arange(input_ids.shape[-1], device=dev).unsqueeze(0) + 1, L.unsqueeze(1))
+    bert_dur = model.bert(input_ids, attention_mask=(~tm).int())
+    enc = {"n": input_ids.shape[-1], "L": L, "tm": tm,
+           "d_en": model.bert_encoder(bert_dur).transpose(-1, -2),
+           "t_en": model.text_encoder(input_ids, L, tm)}
+    _ENC_CACHE[ps] = enc
+    return enc
+
+
+@torch.no_grad()
+def predict_durations(ps, pack, speed=1.0):
+    """Kokoro's own per-token durations (frames, incl. BOS/EOS) for string `ps`
+    spoken by voice `pack`, WITHOUT running the decoder. Identical to the
+    pred_dur that normal generation returns."""
+    enc = _encode(ps)
+    s = pack[len(ps) - 1][:, 128:]                       # same style row as KPipeline.infer
+    d = model.predictor.text_encoder(enc["d_en"], s, enc["L"], enc["tm"])
+    x, _ = model.predictor.lstm(d)
+    duration = torch.sigmoid(model.predictor.duration_proj(x)).sum(axis=-1) / speed
+    return torch.round(duration).clamp(min=1).long().reshape(-1).cpu().tolist()
+
+
+def _durations_cached(ps, pack, vkey, speed):
+    key = (vkey, ps, float(speed))
+    if key not in _DUR_CACHE:
+        _DUR_CACHE[key] = predict_durations(ps, pack, speed)
+    return _DUR_CACHE[key]
+
+
+@torch.no_grad()
+def synth_forced(ps, pack, dur):
+    """Synthesize `ps` with voice `pack` using the GIVEN durations `dur`
+    (len = kept tokens + 2). Pitch/energy and timbre come from the voice."""
+    dev = model.device
+    enc = _encode(ps)
+    ref_s = pack[len(ps) - 1]
+    s = ref_s[:, 128:]
+    d = model.predictor.text_encoder(enc["d_en"], s, enc["L"], enc["tm"])
+    dur = torch.as_tensor(dur, device=dev).long().clamp(min=0).reshape(-1)
+    n = enc["n"]
+    assert dur.shape[0] == n, f"durations ({dur.shape[0]}) != tokens incl. BOS/EOS ({n})"
+    idx = torch.repeat_interleave(torch.arange(n, device=dev), dur)
+    aln = torch.zeros((n, idx.shape[0]), device=dev)
+    aln[idx, torch.arange(idx.shape[0], device=dev)] = 1
+    aln = aln.unsqueeze(0)
+    F0, N = model.predictor.F0Ntrain(d.transpose(-1, -2) @ aln, s)
+    audio = model.decoder(enc["t_en"] @ aln, F0, N, ref_s[:, :128]).squeeze()
+    return audio.cpu().numpy()
+
+
+def synth_aligned(ipa_chunks, voice, speed=1.0, sr=SR, masks=None,
+                  dur_voice=None, dur_source=None, original_chunks=None, origins=None,
+                  diacritic_weight=0.3, use_cache=True):
+    """Synthesize `ipa_chunks` with `voice`; returns (audio, segments, seg_words, seg_altered).
+
+    masks : list parallel to ipa_chunks, from manipulate(..., return_mask=True).
+
+    TIMING
+      dur_voice  : voice whose predicted durations drive the timing
+                   (None = `voice` times itself, i.e. normal Kokoro generation).
+      dur_source : "original"    -> dur_voice speaks `original_chunks` (the
+                                    UNMANIPULATED text); durations are remapped
+                                    onto ipa_chunks via `origins`, so every
+                                    version lands on identical word boundaries.
+                   "manipulated" -> dur_voice speaks ipa_chunks ITSELF (errors
+                                    included); its durations are reused 1:1.
+                   None (default)-> "original" if original_chunks is given,
+                                    else "manipulated".
+      original_chunks : unmanipulated IPA chunks, parallel to ipa_chunks.
+      origins    : from manipulate(..., return_origin=True). None = identity.
+      diacritic_weight : share of a replaced token's frames given to added
+                   diacritics (k -> kʲ). Only used for dur_source="original".
+      speed      : applies to the timing voice's prediction.
+      use_cache  : reuse encoder outputs / durations / chunk audio computed
+                   earlier in this session (see clear_synth_cache())."""
+    if dur_source is None:
+        dur_source = "original" if original_chunks is not None else "manipulated"
+    assert dur_source in ("original", "manipulated"), dur_source
+    if dur_source == "original":
+        assert original_chunks is not None and len(original_chunks) == len(ipa_chunks), \
+            "dur_source='original' needs original_chunks, parallel to ipa_chunks"
+        assert origins is None or len(origins) == len(ipa_chunks)
+    if not use_cache:
+        clear_synth_cache()
+
+    pack, vkey = _voice_pack(voice)
+    dpack, dkey = _voice_pack(dur_voice) if dur_voice is not None else (pack, vkey)
+
     audios, segments, seg_words, seg_altered = [], [], [], []
     t0, word_offset = 0.0, 0
     for ci, ps in enumerate(ipa_chunks):
         if not ps.strip():
             continue
-        r = next(gen.generate_from_tokens(tokens=ps, voice=voice, speed=speed))
-        a = r.audio.detach().cpu().numpy()
+        if dur_source == "manipulated":
+            dur = _durations_cached(ps, dpack, dkey, speed)
+        else:
+            orig = original_chunks[ci]
+            dur = transfer_durations(orig, ps, origins[ci] if origins is not None else None,
+                                     _durations_cached(orig, dpack, dkey, speed), diacritic_weight)
+        akey = (vkey, ps, tuple(dur))
+        a = _AUDIO_CACHE.get(akey)
+        if a is None:
+            a = synth_forced(ps, pack, dur)
+            _AUDIO_CACHE[akey] = a
         chunk_mask = masks[ci] if masks is not None else None
-        segs, widx, altd = align_phonemes(r.phonemes, r.pred_dur, n_samples=len(a), sr=sr,
-                                           altered_mask=chunk_mask)
-        segments += [(lab, s + t0, e + t0) for lab, s, e in segs]
-        seg_words += [w + word_offset for w in widx]
+        segs, widx, altd = align_phonemes(ps, dur, n_samples=len(a), sr=sr, altered_mask=chunk_mask)
+        segments += [(lab, s + t0, e + t0, info) for lab, s, e, info in segs]
+        seg_words += [None if w is None else w + word_offset for w in widx]
         seg_altered += altd
-        word_offset += (widx[-1] + 1) if widx else 0
+        real = [w for w in widx if w is not None]
+        word_offset += (max(real) + 1) if real else 0
         audios.append(a); t0 += len(a) / sr
     return np.concatenate(audios), segments, seg_words, seg_altered
 
@@ -630,10 +881,19 @@ def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row
     step = max(1, len(audio)//N)
     env = np.abs(audio[:step*(len(audio)//step)].reshape(-1, step)).max(axis=1)
     env = (env/(env.max() or 1)).round(3).tolist()
-    segs = [{"l": lab, "s": round(s, 4), "e": round(e, 4)} for lab, s, e in segments]
+    segs = []
+    for seg in segments:                                   # (tok, s, e) or (tok, s, e, info)
+        tok, s, e = seg[:3]
+        info = seg[3] if len(seg) > 3 and isinstance(seg[3], dict) else {}
+        g = {"l": ''.join(LABEL_DISPLAY.get(c, c) for c in tok) if tok not in ("BOS", "EOS") else tok,
+             "t": tok, "k": info.get("kind", "phone"),
+             "s": round(s, 4), "e": round(e, 4),
+             "ms": info.get("ms", round((e - s) * 1000, 1)), "fr": info.get("fr")}
+        segs.append(g)
     dur = len(audio)/sr
     if seg_words is not None and text is not None:
-        n_words = (max(seg_words) + 1) if seg_words else 0
+        real_words = [w for w in seg_words if w is not None]
+        n_words = (max(real_words) + 1) if real_words else 0
         word_labels = text.split()
         if len(word_labels) != n_words:
             print(f"⚠ word count mismatch: text has {len(word_labels)} words, "
@@ -641,7 +901,7 @@ def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row
         for i, seg in enumerate(segs):
             wi = seg_words[i]
             seg["w"] = wi
-            seg["wl"] = word_labels[wi] if wi < len(word_labels) else ""
+            seg["wl"] = (word_labels[wi] if wi < len(word_labels) else "") if wi is not None else None
     if seg_altered is not None:
         if len(seg_altered) != len(segs):
             print(f"⚠ seg_altered length ({len(seg_altered)}) != segments ({len(segs)}) — skipping alter-highlighting")
@@ -662,13 +922,17 @@ def audiovisualize_interactive(audio, segments, sr=24000, out_html=None, per_row
                     .replace("__RULES__", json.dumps(rules_text)) \
                     .replace("__STATS__", json.dumps(stats or []))
     if out_html:
-        out_dir = os.path.join(os.getcwd(), "outputs")
+        out_dir = os.path.join(os.getcwd(), "output_online")
         os.makedirs(out_dir, exist_ok=True)
 
         full_path = os.path.join(out_dir, out_html)
         print(f"Writing interactive HTML to: {full_path}")
+        page = ('<!DOCTYPE html>\n<html><head><meta charset="utf-8">\n'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+                f'<title>{_html_escape(title or "Kokoro")}</title></head>\n<body>\n'
+                + html + '\n</body></html>\n')
         with open(full_path, "w", encoding="utf-8") as f:
-            f.write(html)
+            f.write(page)
 
     return html
 
@@ -692,6 +956,9 @@ _TEMPLATE = r"""
     <span style="border-bottom:3px solid #f59e0b;padding:0 3px;color:#b45309;font-weight:700;">phoneme</span>
     &nbsp;= altered by manipulation rule
 </div>
+<div id="durNote" style="font-size:11px;color:#666;margin:0 0 8px;display:none;">
+    Every Kokoro token is shown with its predicted duration in ms (hover for frames): phonemes, diacritics (ʲ ː …), stress marks (ˈ), punctuation, ␣ = word gap, BOS/EOS = chunk start/end. Word totals include the word's own tokens only.
+</div>
 <canvas id="wf" width="1040" height="80" style="width:100%;height:80px;background:#0b1020;border-radius:6px;cursor:pointer"></canvas>
 <div id="ph" style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:0;margin-top:16px;"></div>
 </div>
@@ -713,6 +980,7 @@ if (RULES) {
 }
 
 if (segs.some(g=>g.alt)) legend.style.display='block';
+if (segs.some(g=>g.ms!==undefined)) document.getElementById('durNote').style.display='block';
 
 // ---- substitution-count legend ----
 if (STATS && STATS.length) {
@@ -765,39 +1033,68 @@ if (STATS && STATS.length) {
     document.getElementById('statsTotal').textContent='— '+grand+' change'+(grand===1?'':'s')+' in total';
     box.style.display='block';
 }
+// units = word boxes (tokens with the same word index) + standalone tokens (space / BOS / EOS)
 let groups=[];
-if (segs.length && segs[0].w !== undefined) {
-    segs.forEach((g,i)=>{
-        const last=groups[groups.length-1];
-        if (last && last.w===g.w) { last.segIdx.push(i); last.e=g.e; }
-        else { groups.push({w:g.w, wl:g.wl, s:g.s, e:g.e, segIdx:[i]}); }
-    });
-} else {
-    groups = segs.map((g,i)=>({w:i, wl:null, s:g.s, e:g.e, segIdx:[i]}));
+segs.forEach((g,i)=>{
+    const last=groups[groups.length-1];
+    const inWord = g.w!==undefined && g.w!==null;
+    if (inWord && last && last.w===g.w) { last.segIdx.push(i); last.e=g.e; last.ms+=g.ms; }
+    else groups.push({w: inWord ? g.w : null, wl: inWord ? g.wl : null, s:g.s, e:g.e, ms:g.ms, segIdx:[i]});
+});
+const KIND_STYLE={
+    phone:     'color:#111;',
+    diacritic: 'color:#4b5563;',
+    stress:    'color:#4b5563;',
+    punct:     'color:#6b7280;',
+    space:     'color:#9ca3af;',
+    bos:       'color:#9ca3af;font-size:12px;',
+    eos:       'color:#9ca3af;font-size:12px;',
+};
+const KIND_NAME={phone:'phoneme',diacritic:'diacritic',stress:'stress mark',punct:'punctuation / pause',
+                 space:'word gap',bos:'chunk start (BOS)',eos:'chunk end (EOS)'};
+function makeChip(i){
+    const g=segs[i], altered=!!g.alt;
+    const c=document.createElement('span');
+    c.dataset.i=i; c.dataset.alt=altered?'1':'0'; c.dataset.k=g.k;
+    c.style.cssText='display:inline-flex;flex-direction:column;align-items:center;vertical-align:top;'
+        + 'padding:2px 4px;margin:0 1px;border-radius:6px;cursor:pointer;transition:.05s;min-width:14px;'
+        + (altered ? 'color:#b45309;font-weight:700;' : (KIND_STYLE[g.k]||''));
+    c.dataset.col = c.style.color;
+    const lab=document.createElement('span');
+    lab.textContent=g.l;
+    if (altered) lab.style.borderBottom='3px solid #f59e0b';
+    const ms=document.createElement('span');
+    ms.textContent=Math.round(g.ms);
+    ms.style.cssText='font-size:11px;font-weight:400;letter-spacing:0;opacity:.75;margin-top:1px;font-variant-numeric:tabular-nums;';
+    c.appendChild(lab); c.appendChild(ms);
+    c.title=(KIND_NAME[g.k]||g.k)+(altered?' · manipulated':'')+(g.t!==g.l&&g.k!=='space'?' · Kokoro token '+g.t:'')
+        +'\n'+(g.fr!==null&&g.fr!==undefined ? g.fr+' frames = ' : '')+g.ms+' ms';
+    c.onclick=()=>{ au.currentTime=g.s; au.play(); };
+    return c;
 }
 groups.forEach((grp, gi)=>{
+    if (grp.w===null) {                                    // standalone token between words
+        const box=document.createElement('div');
+        box.style.cssText='display:inline-block;vertical-align:top;margin:2px 6px 12px 0;padding:6px 2px;'
+            + 'font-size:18px;border:1px dashed #e5e7eb;border-radius:8px;';
+        box.appendChild(makeChip(grp.segIdx[0]));
+        ph.appendChild(box);
+        return;
+    }
     const wrap=document.createElement('div');
     wrap.dataset.gi=gi;
-    wrap.style.cssText='display:inline-block;vertical-align:top;margin:2px 10px 12px 0;padding:6px 10px;border-radius:9px;background:#f8f9fb;border:1.5px solid #e5e7eb;transition:.08s;';
-    if (grp.wl !== null) {
-        const wl=document.createElement('div');
-        wl.textContent = grp.wl || '·';
-        wl.style.cssText='font-size:23px;font-weight:700;color:#111;margin-bottom:4px;letter-spacing:.2px;';
-        wrap.appendChild(wl);
-    }
+    wrap.style.cssText='display:inline-block;vertical-align:top;margin:2px 6px 12px 0;padding:6px 8px;border-radius:9px;background:#f8f9fb;border:1.5px solid #e5e7eb;transition:.08s;';
+    const wl=document.createElement('div');
+    wl.textContent = grp.wl || '·';
+    wl.style.cssText='font-size:23px;font-weight:700;color:#111;margin-bottom:4px;letter-spacing:.2px;';
+    const wd=document.createElement('span');
+    wd.textContent='  '+Math.round(grp.ms)+' ms';
+    wd.style.cssText='font-size:11px;font-weight:400;color:#888;letter-spacing:0;';
+    wl.appendChild(wd);
+    wrap.appendChild(wl);
     const prow=document.createElement('div');
-    prow.style.cssText='font-size:21px;letter-spacing:1.5px;white-space:nowrap;';
-    grp.segIdx.forEach(i=>{
-        const s=document.createElement('span');
-        s.textContent=segs[i].l; s.dataset.i=i;
-        const altered = !!segs[i].alt;
-        s.dataset.alt = altered ? '1' : '0';
-        s.style.cssText='padding:2px 6px;margin:0 1px;border-radius:6px;cursor:pointer;transition:.05s;'
-            + (altered ? 'border-bottom:3px solid #f59e0b;color:#b45309;font-weight:700;' : '');
-        if (altered) s.title = 'manipulated phoneme';
-        s.onclick=()=>{ au.currentTime=segs[i].s; au.play(); };
-        prow.appendChild(s);
-    });
+    prow.style.cssText='font-size:21px;white-space:nowrap;';
+    grp.segIdx.forEach(i=>prow.appendChild(makeChip(i)));
     wrap.appendChild(prow);
     ph.appendChild(wrap);
 });
@@ -808,7 +1105,7 @@ function drawWave(){ const W=wf.width,H=wf.height; ctx.clearRect(0,0,W,H);
     segs.forEach(g=>{ if(g.e<a||g.s>b)return; const x=(g.s-a)/(b-a)*W, w=(g.e-g.s)/(b-a)*W;
         ctx.fillStyle=(g.s<=au.currentTime&&au.currentTime<g.e)?'#2563eb55':'#ffffff10'; ctx.fillRect(x,0,Math.max(w,1),H);});
     ctx.strokeStyle='#ffffff30';
-    groups.forEach(g=>{ if(g.s<a||g.s>b)return; const x=(g.s-a)/(b-a)*W;
+    groups.forEach(g=>{ if(g.w===null||g.s<a||g.s>b)return; const x=(g.s-a)/(b-a)*W;
         ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); });
     ctx.strokeStyle='#7dd3fc'; ctx.beginPath();
     for(let x=0;x<W;x++){ const t=a+(b-a)*x/W, idx=Math.floor(t/DUR*n); const v=env[Math.max(0,Math.min(n-1,idx))]||0;
@@ -820,7 +1117,7 @@ function tick(){ const t=au.currentTime; let act=-1;
     for(let i=0;i<segs.length;i++){ if(segs[i].s<=t && t<segs[i].e){act=i;break;} }
     chips.forEach((c,i)=>{ const on=(+c.dataset.i===act); const altered=c.dataset.alt==='1';
         c.style.background=on?'#2563eb':'transparent';
-        c.style.color=on?'#fff':(altered?'#b45309':'#111'); });
+        c.style.color=on?'#fff':c.dataset.col; });
     wordWraps.forEach(w=>{ w.style.borderColor='#e5e7eb'; w.style.background='#f8f9fb'; });
     if (act>=0){
         const wrap=chips[act].closest('[data-gi]');
@@ -844,3 +1141,81 @@ drawWave();
 })();
 </script>
 """
+
+# =============================================================================
+# LISTENING TEST — participant page
+#   build_listening_test(audio, segments, seg_words, text, seg_altered, ...)
+#   One sentence at a time: listen -> text appears -> tap the words not
+#   understood -> next. Answers are sent (optionally) to a Google Sheet and can
+#   always be downloaded as CSV at the end.
+# =============================================================================
+
+# TEST_UI / _audio_data_uri / the participant-page template and its writer all
+# live in experiment.py, which has NO kokoro/torch dependency, so building or
+# rebuilding a participant page never needs the model. build_listening_test()
+# below is only the "live session" path (straight off a synth_aligned() call);
+# build_listening_test_from_html() in experiment.py is the "saved file" path —
+# use that one whenever you can, especially for adding/editing conditions later.
+from experiment import TEST_UI, _audio_data_uri, _write_test_page  # noqa: F401
+from experiment import load_visualization, build_listening_test_from_html  # noqa: F401 (re-exported for convenience)
+
+
+def _test_chunks(audio, segments, seg_words, text, seg_altered, sr):
+    """Cut the synthesized story back into its sentences (using the BOS/EOS
+    tokens that synth_aligned emits) and pair each with its words."""
+    sents = one_sentence_chunks(text)
+    spans, cur = [], None
+    for i, seg in enumerate(segments):
+        tok, s, e = seg[:3]
+        if tok == "BOS":
+            cur = {"s": s, "altered": {}}
+        w = seg_words[i] if seg_words is not None else None
+        if cur is not None and w is not None:
+            cur["altered"][w] = cur["altered"].get(w, False) or bool(seg_altered and seg_altered[i])
+        if tok == "EOS" and cur is not None:
+            cur["e"] = e; spans.append(cur); cur = None
+    if not spans:
+        raise ValueError("no BOS/EOS tokens in segments — pass the output of the current synth_aligned()")
+    if len(spans) != len(sents):
+        raise ValueError(f"{len(spans)} audio chunks but {len(sents)} sentences in `text` — "
+                         "pass the same text you gave text_to_ipa_chunks()")
+    out = []
+    for j, (sp, sent) in enumerate(zip(spans, sents)):
+        words = sent.split()
+        keys = sorted(sp["altered"])
+        if len(keys) != len(words):
+            print(f"⚠ sentence {j+1}: {len(words)} written words vs {len(keys)} spoken words "
+                  f"— 'altered' flags may be shifted: {sent[:60]!r}")
+        altered = [int(sp["altered"][keys[k]]) if k < len(keys) else 0 for k in range(len(words))]
+        a = audio[int(round(sp["s"] * sr)):int(round(sp["e"] * sr))]
+        out.append({"words": words, "altered": altered, "audio": a})
+    return out
+
+
+def build_listening_test(audio, segments, seg_words, text, seg_altered=None, sr=SR,
+                         out_html="listening_test.html", out_dir="listening_test",
+                         test_id="story", version="v1", submit_url=None, max_plays=1,
+                         lang="en", ui=None, completion_url=None, audio_format="mp3"):
+    """Self-contained participant page (one HTML file, audio embedded).
+
+    audio, segments, seg_words, seg_altered : output of synth_aligned()
+    text        : the SAME text you passed to text_to_ipa_chunks(); its
+                  sentences are what participants read.
+    test_id     : name of the study/story, stored with every answer
+    version     : which version this file is (e.g. "clean"), stored with every answer
+    submit_url  : Google Apps Script web-app URL that appends answers to a sheet
+                  (None = participants download a CSV and send it to you)
+    max_plays   : listens allowed per sentence before the text appears (None = unlimited)
+    lang        : "en" or "it" interface text; `ui` = dict to override any string
+    completion_url : optional link shown at the end (e.g. a Prolific completion URL)
+
+    The participant code is read from the URL (?pid=..., or Prolific's
+    ?PROLIFIC_PID=...) or typed on the first screen.
+    Answers are one row per word: test, version, participant, session, chunk,
+    word_pos, word, word_clean, altered (0/1, from your rules), not_understood
+    (0/1), plays, listen_ms, response_ms, time."""
+    chunks = _test_chunks(np.asarray(audio, dtype=np.float32), segments, seg_words, text, seg_altered, sr)
+    payload = [{"audio": _audio_data_uri(c["audio"], sr, audio_format),
+                "words": c["words"], "altered": c["altered"]} for c in chunks]
+    return _write_test_page(payload, out_html, out_dir, test_id, version, submit_url,
+                            max_plays, lang, ui, completion_url)

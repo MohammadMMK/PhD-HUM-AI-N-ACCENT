@@ -219,7 +219,8 @@ if __name__ == "__main__":
 
     print("\n--- Creating blends ---")
     specs = {
-        "hf_alpha_af_heart_t05_p05": {"hf_alpha": 0.5, "af_heart": 0.5},
+        # "nicola_80": {"im_nicola": 0.8, "if_sara": 0.2},
+        "nicola_100": {"im_nicola": 1.0, "if_sara": 0}
     }
     blends = blender.create_blends(specs)
 
