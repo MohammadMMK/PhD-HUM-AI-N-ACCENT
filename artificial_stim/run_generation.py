@@ -35,7 +35,7 @@ with open("story1.txt", "r", encoding="utf-8") as f:
 STORIES = {
     "1": story1,
 }
-
+SPEED = 0.80
 # ---------------------------------------------------------------------------
 # error rule sets — add a dict here for a new kind of error
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ def render(name, text, chunks, masks=None, rules=None, stats=None, **timing):
         return
     t = time.time()
     audio, segments, seg_words, seg_altered = synth_aligned(
-        chunks, voice, masks=masks, dur_voice=dur_voice, **timing)
+        chunks, voice, speed=SPEED, masks=masks, dur_voice=dur_voice, **timing)
     audiovisualize_interactive(
         audio, segments, seg_words=seg_words, text=text, seg_altered=seg_altered,
         title=name, rules=rules, stats=stats, out_html=f"{name}.html")
@@ -78,12 +78,12 @@ for sid, text in STORIES.items():
     print(f"story {sid}")
     ipa_chunks = text_to_ipa_chunks(text)
     check_ipa(ipa_chunks)
-    render(f"story{sid}__clean", text, ipa_chunks, dur_source="manipulated")
+    render(f"story{sid}__clean_0.8", text, ipa_chunks, dur_source="manipulated")
     for rname, rules in RULESETS.items():
         manip_chunks, masks, stats, origins = manipulate(
             ipa_chunks, rules, return_mask=True, return_stats=True, return_origin=True, seed=42)
         for tname, timing in TIMINGS.items():
-            render(f"story{sid}__{rname}_dur_forced_{tname}", text, manip_chunks, masks, rules, stats,
+            render(f"story{sid}__{rname}_dur_forced_{tname}_0.8", text, manip_chunks, masks, rules, stats,
                    **timing(ipa_chunks, origins))
 
 print("done — saved pages are in ./outputs/. Next: python build_experiment.py")
