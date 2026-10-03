@@ -20,7 +20,7 @@ from functions import (
 
 VOICES_DIR = Path("custom_voices")
 OUT_DIR = Path("output_online"); OUT_DIR.mkdir(exist_ok=True)
-SKIP_EXISTING = True      # don't regenerate versions that are already in outputs/
+SKIP_EXISTING = False      # don't regenerate versions that are already in outputs/
 
 voice     = torch.load(VOICES_DIR / "nicola_80.pt",  weights_only=True)   # the voice you hear
 dur_voice = torch.load(VOICES_DIR / "nicola_100.pt", weights_only=True)   # reference timing
@@ -31,11 +31,11 @@ dur_voice = torch.load(VOICES_DIR / "nicola_100.pt", weights_only=True)   # refe
 
 with open("story1.txt", "r", encoding="utf-8") as f:
     story1 = f.read()
-# story1 = story1[:200] 
+story1 = story1[:500] 
 STORIES = {
     "1": story1,
 }
-SPEED = 0.80
+SPEED = 0.90
 # ---------------------------------------------------------------------------
 # error rule sets — add a dict here for a new kind of error
 # ---------------------------------------------------------------------------
@@ -44,7 +44,9 @@ RULESETS = {
         {"kind": "substitute_prob", "old": "d", "choices": {"ʈ": 100}, "same_in_word": True},
         {"kind": "substitute_prob", "old": "k", "choices": {"χ": 100}, "same_in_word": True},
         {"kind": "substitute_prob", "old": "e", "choices": {"ø": 100}, "same_in_word": True},
-    ],
+    ]
+    # 
+    ,
     "less_consistent": [
         {"kind": "substitute_prob", "old": "d", "choices": {"ʈ": 33, "θ": 33, "dʲ": 33}, "same_in_word": True},
         {"kind": "substitute_prob", "old": "k", "choices": {"x": 33, "χ": 33, "kʲ": 33}, "same_in_word": True},
@@ -57,6 +59,7 @@ RULESETS = {
 TIMINGS = {
     "native":   lambda ipa, origins: dict(dur_source="original", original_chunks=ipa, origins=origins),
     # "accented": lambda ipa, origins: dict(dur_source="manipulated"),
+    "free":     lambda ipa, origins: dict(),   # NEW: no forced duration, the voice predicts its own timing
 }
 
 
@@ -65,8 +68,10 @@ def render(name, text, chunks, masks=None, rules=None, stats=None, **timing):
         print(f"  {name}: already in outputs/, skipped")
         return
     t = time.time()
+    if timing:                                  # NEW: reference timing voice only when duration is forced
+        timing["dur_voice"] = dur_voice
     audio, segments, seg_words, seg_altered = synth_aligned(
-        chunks, voice, speed=SPEED, masks=masks, dur_voice=dur_voice, **timing)
+        chunks, voice, speed=SPEED, masks=masks, **timing)
     audiovisualize_interactive(
         audio, segments, seg_words=seg_words, text=text, seg_altered=seg_altered,
         title=name, rules=rules, stats=stats, out_html=f"{name}.html")
@@ -78,12 +83,14 @@ for sid, text in STORIES.items():
     print(f"story {sid}")
     ipa_chunks = text_to_ipa_chunks(text)
     check_ipa(ipa_chunks)
-    render(f"story{sid}__clean_0.8", text, ipa_chunks, dur_source="manipulated")
+    render(f"story{sid}__clean_0.9t", text, ipa_chunks, dur_source="manipulated")
     for rname, rules in RULESETS.items():
         manip_chunks, masks, stats, origins = manipulate(
             ipa_chunks, rules, return_mask=True, return_stats=True, return_origin=True, seed=42)
         for tname, timing in TIMINGS.items():
-            render(f"story{sid}__{rname}_dur_forced_{tname}_0.8", text, manip_chunks, masks, rules, stats,
-                   **timing(ipa_chunks, origins))
+            kw = timing(ipa_chunks, origins)
+            dur_tag = f"dur_forced_{tname}" if kw else "dur_free"   # NEW: name reflects forced / free
+            render(f"story{sid}__{rname}_{dur_tag}_{SPEED}asp", text, manip_chunks, masks, rules, stats,
+                   **kw)
 
 print("done — saved pages are in ./outputs/. Next: python build_experiment.py")
