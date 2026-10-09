@@ -220,7 +220,12 @@ if __name__ == "__main__":
     print("\n--- Creating blends ---")
     specs = {
         # "nicola_80": {"im_nicola": 0.8, "if_sara": 0.2},
-        "nicola_100": {"im_nicola": 1.0, "if_sara": 0}
+        "nicola_70": {"im_nicola": 0.7, "if_sara": 0.3},
+        "nicola_60": {"im_nicola": 0.6, "if_sara": 0.4},
+        "nicola_50": {"im_nicola": 0.5, "if_sara": 0.5 },
+        "nicola_40": {"im_nicola": 0.4, "if_sara": 0.6},
+        "nicola_30": {"im_nicola": 0.3, "if_sara": 0.7},
+        "nicola_20": {"im_nicola": 0.2, "if_sara": 0.8},
     }
     blends = blender.create_blends(specs)
 
