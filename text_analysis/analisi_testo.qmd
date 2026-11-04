@@ -1,0 +1,432 @@
+---
+title: "Analysing an Italian Text"
+subtitle: "Feature extraction in Python (spaCy), analysis and plots in R"
+format:
+  html:
+    toc: true
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Setup
+
+This document uses **two languages** in the same file:
+
+- **Python** (spaCy) reads the text and extracts the features: words, lemmas, parts of speech, sentences. It also looks up how common each word is in general Italian, using **wordfreq**.
+- **R** (dplyr + ggplot2) analyses the features and draws the plots.
+
+Python writes its tables to CSV files and R reads them back. This hand-off works with any version of pandas and reticulate.
+
+Install once:
+
+```bash
+# Python
+pip install spacy pandas wordfreq
+python -m spacy download it_core_news_sm
+
+# R (from the R console)
+install.packages(c("reticulate", "dplyr", "tidyr", "ggplot2", "knitr", "rmarkdown"))
+```
+
+Then render with `quarto render analisi_testo.qmd`.
+
+```{r}
+#| label: setup-r
+library(reticulate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# If you have several Python installations, point to the one with spaCy:
+# use_python("/path/to/your/python")
+
+theme_set(theme_minimal(base_size = 13))
+```
+
+## 1. Feature extraction (Python)
+
+### The text
+
+To analyse your own text, put the file path in `TEXT_FILE`. If you leave it empty, the sample text is used.
+
+```{python}
+#| label: text
+TEXT_FILE = ""   # e.g. "my_text.txt" (saved as UTF-8)
+
+SAMPLE_TEXT = """Nel mezzo del cammin di nostra vita mi ritrovai per una selva oscura,
+ché la diritta via era smarrita. Ahi quanto a dir qual era è cosa dura
+esta selva selvaggia e aspra e forte che nel pensier rinova la paura!
+Tant' è amara che poco è più morte; ma per trattar del ben ch'i' vi trovai,
+dirò de l'altre cose ch'i' v'ho scorte.
+La città era silenziosa quella mattina. Le strade, ancora bagnate dalla pioggia
+della notte, brillavano sotto gli ultimi lampioni accesi. Marco camminava piano,
+pensando all'estate passata al mare con gli amici, alle lunghe serate sulla
+spiaggia e alle promesse fatte e mai mantenute. Che strana giornata, pensò.
+Si fermò davanti al bar della piazza. Il barista lo salutò con un cenno.
+Prese un caffè, poi un altro. Fuori, la città cominciava lentamente a svegliarsi:
+le prime macchine, le voci dei bambini che andavano a scuola, il rumore delle
+serrande che si alzavano. Domani, forse, il sole sarebbe tornato a splendere
+sulla città, e lui avrebbe finalmente deciso cosa fare della sua vita."""
+
+if TEXT_FILE:
+    with open(TEXT_FILE, encoding="utf-8") as f:
+        text = f.read()
+else:
+    text = SAMPLE_TEXT
+```
+
+### The spaCy model
+
+```{python}
+#| label: model
+import re
+import spacy
+import pandas as pd
+from wordfreq import zipf_frequency
+
+nlp = spacy.load("it_core_news_sm")
+
+# Split sentences reliably on . ! ? (the parser alone sometimes merges them)
+nlp.add_pipe("sentencizer", before="parser")
+
+# Fixes to spaCy's Italian stopword list:
+# it includes "città" (it shouldn't) and misses some articles
+nlp.vocab["città"].is_stop = False
+for w in ["i", "gli", "le", "lo", "l"]:
+    nlp.Defaults.stop_words.add(w)
+    nlp.vocab[w].is_stop = True
+
+# Line breaks inside a sentence should not act as separators
+clean_text = re.sub(r"\s+", " ", text).strip()
+doc = nlp(clean_text)
+```
+
+### Word table (one row per word)
+
+We keep only alphabetic tokens, so no punctuation, numbers or spaces.
+
+```{python}
+#| label: word-table
+rows = []
+for sentence_id, sentence in enumerate(doc.sents, start=1):
+    for tok in sentence:
+        if tok.is_alpha:
+            rows.append({
+                "sentence": sentence_id,
+                "word":     tok.lower_,
+                "lemma":    tok.lemma_.lower(),
+                "pos":      tok.pos_,        # part of speech: NOUN, VERB, ...
+                "stopword": tok.is_stop,
+                "length":   len(tok.text),   # number of letters
+            })
+
+words = pd.DataFrame(rows)
+words.head(10)
+```
+
+### Sentence table (one row per sentence)
+
+```{python}
+#| label: sentence-table
+sentences = pd.DataFrame([
+    {
+        "sentence": i,
+        "n_words":  sum(1 for t in s if t.is_alpha),
+        "text":     s.text.strip(),
+    }
+    for i, s in enumerate(doc.sents, start=1)
+])
+sentences = sentences[sentences["n_words"] > 0].reset_index(drop=True)
+sentences.head()
+```
+
+### General frequency in Italian (wordfreq)
+
+**wordfreq** gives the frequency of a word in general Italian, combined from several large corpora (Wikipedia, subtitles, news, web text, books and others). It uses the **Zipf scale**:
+
+| Zipf | Meaning | Example |
+|---|---|---|
+| 7 | extremely common | *il*, *di* |
+| 5–6 | common everyday word | *città*, *casa* |
+| 3–4 | less common, still familiar | *selva*, *barista* |
+| 1–2 | rare | |
+| 0 | not in the lists | archaic or very rare forms |
+
+Zipf = log10(occurrences per billion words), so each step up means 10× more frequent.
+
+```{python}
+#| label: general-frequency
+vocab = words.groupby("word", as_index=False).agg(
+    count=("word", "size"),
+    stopword=("stopword", "first"),
+)
+vocab["zipf_general"] = [zipf_frequency(w, "it") for w in vocab["word"]]
+vocab.sort_values("zipf_general").head()
+```
+
+Save the tables as CSV for R. You can also open them in Excel or anything else without rerunning the extraction.
+
+```{python}
+#| label: save-csv
+words.to_csv("words.csv", index=False)
+sentences.to_csv("sentences.csv", index=False)
+vocab.to_csv("vocab.csv", index=False)
+```
+
+## 2. Analysis (R)
+
+From here on we work in R, reading the CSV files written by Python.
+
+```{r}
+#| label: import
+# Python writes True/False; convert to R's logical TRUE/FALSE
+to_logical <- function(x) as.logical(toupper(x))
+
+words     <- as_tibble(read.csv("words.csv", encoding = "UTF-8")) |>
+  mutate(stopword = to_logical(stopword))
+sentences <- as_tibble(read.csv("sentences.csv", encoding = "UTF-8"))
+vocab     <- as_tibble(read.csv("vocab.csv", encoding = "UTF-8")) |>
+  mutate(stopword = to_logical(stopword))
+
+# Alternatively, with recent versions of reticulate you can read
+# the Python objects directly: words <- as_tibble(py$words)
+```
+
+### Summary statistics
+
+```{r}
+#| label: summary
+summary_table <- tibble(
+  Measure = c(
+    "Total words",
+    "Distinct words (forms)",
+    "Distinct lemmas",
+    "Type/token ratio",
+    "Sentences",
+    "Words per sentence (mean)",
+    "Words per sentence (median)",
+    "Letters per word (mean)"
+  ),
+  Value = c(
+    nrow(words),
+    n_distinct(words$word),
+    n_distinct(words$lemma),
+    round(n_distinct(words$word) / nrow(words), 3),
+    nrow(sentences),
+    round(mean(sentences$n_words), 1),
+    median(sentences$n_words),
+    round(mean(words$length), 2)
+  )
+)
+knitr::kable(summary_table)
+```
+
+The **type/token ratio** (distinct words ÷ total words) measures lexical variety: the closer to 1, the fewer words are repeated. It depends heavily on text length, so only compare it between texts of similar length.
+
+### Word frequency
+
+```{r}
+#| label: fig-word-freq
+#| fig-cap: "The 15 most frequent words (stopwords excluded)"
+word_freq <- words |>
+  filter(!stopword) |>
+  count(word, sort = TRUE)
+
+word_freq |>
+  slice_head(n = 15) |>
+  ggplot(aes(x = n, y = reorder(word, n))) +
+  geom_col(fill = "#2E86AB") +
+  labs(x = "Occurrences", y = NULL)
+```
+
+Counting by **lemma** groups the inflected forms of the same word (e.g. *pensò*, *pensando* → *pensare*).
+
+```{r}
+#| label: fig-lemma-freq
+#| fig-cap: "The 15 most frequent lemmas (stopwords excluded)"
+lemma_freq <- words |>
+  filter(!stopword) |>
+  count(lemma, sort = TRUE)
+
+lemma_freq |>
+  slice_head(n = 15) |>
+  ggplot(aes(x = n, y = reorder(lemma, n))) +
+  geom_col(fill = "#A23B72") +
+  labs(x = "Occurrences", y = NULL)
+```
+
+### Sentence length
+
+```{r}
+#| label: fig-sentence-length
+#| fig-cap: "Distribution of sentence length"
+ggplot(sentences, aes(x = n_words)) +
+  geom_histogram(binwidth = 2, fill = "#2E86AB", colour = "white") +
+  geom_vline(xintercept = mean(sentences$n_words), linetype = "dashed") +
+  annotate("text", x = mean(sentences$n_words), y = Inf, vjust = 1.5, hjust = -0.1,
+           label = paste("mean =", round(mean(sentences$n_words), 1))) +
+  labs(x = "Words per sentence", y = "Number of sentences")
+```
+
+```{r}
+#| label: fig-rhythm
+#| fig-cap: "Sentence length through the text: the 'rhythm' of the writing"
+ggplot(sentences, aes(x = sentence, y = n_words)) +
+  geom_line(colour = "grey60") +
+  geom_point(size = 2.5, colour = "#2E86AB") +
+  labs(x = "Sentence no.", y = "Words")
+```
+
+The longest and shortest sentences:
+
+```{r}
+#| label: extremes
+sentences |>
+  arrange(desc(n_words)) |>
+  slice(c(1:3, (n() - 2):n())) |>
+  knitr::kable()
+```
+
+### Word length
+
+```{r}
+#| label: fig-word-length
+#| fig-cap: "Distribution of word length, stopwords vs content words"
+words |>
+  mutate(type = if_else(stopword, "Stopwords", "Content words")) |>
+  ggplot(aes(x = length, fill = type)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Content words" = "#2E86AB", "Stopwords" = "#BBBBBB")) +
+  labs(x = "Letters", y = "Number of words", fill = NULL)
+```
+
+### Parts of speech
+
+```{r}
+#| label: fig-pos
+#| fig-cap: "Parts of speech"
+pos_labels <- c(
+  NOUN = "Noun", VERB = "Verb", ADJ = "Adjective", ADV = "Adverb",
+  DET = "Article/Determiner", ADP = "Preposition", PRON = "Pronoun",
+  AUX = "Auxiliary", CCONJ = "Coord. conjunction", SCONJ = "Subord. conjunction",
+  PROPN = "Proper noun", NUM = "Numeral", INTJ = "Interjection"
+)
+
+words |>
+  count(pos) |>
+  mutate(
+    label = coalesce(pos_labels[pos], pos),
+    pct = n / sum(n) * 100
+  ) |>
+  ggplot(aes(x = pct, y = reorder(label, pct))) +
+  geom_col(fill = "#F18F01") +
+  labs(x = "% of words", y = NULL)
+```
+
+## 3. Comparison with general Italian
+
+Here we compare how often each word appears **in this text** with how often it appears **in Italian in general**.
+
+To put both on the same scale, we turn the text counts into a Zipf value too: occurrences per billion words, then log10. The difference between the two (`keyness`) shows words that are much more frequent here than usual. These are the words that characterise the text.
+
+```{r}
+#| label: keyness
+total_words <- nrow(words)
+
+vocab <- vocab |>
+  mutate(
+    zipf_text = log10(count / total_words * 1e9),
+    keyness   = zipf_text - zipf_general
+  )
+```
+
+### How rare is the vocabulary?
+
+```{r}
+#| label: fig-rarity
+#| fig-cap: "Distribution of the text's vocabulary by general frequency (content words)"
+vocab |>
+  filter(!stopword) |>
+  mutate(band = cut(
+    zipf_general,
+    breaks = c(-Inf, 0.5, 2, 3, 4, 5, Inf),
+    labels = c("Not listed", "Rare (<2)", "2-3", "3-4", "4-5", "Common (5+)")
+  )) |>
+  count(band) |>
+  ggplot(aes(x = band, y = n)) +
+  geom_col(fill = "#2E86AB") +
+  labs(x = "General frequency (Zipf)", y = "Distinct words")
+```
+
+Words with Zipf 0 are not in wordfreq's lists. In the sample text these are mostly archaic forms from Dante, such as *rinova*.
+
+```{r}
+#| label: not-listed
+vocab |>
+  filter(zipf_general == 0) |>
+  select(word, count) |>
+  knitr::kable()
+```
+
+### The rarest words in the text
+
+The content words that are least common in general Italian. These often tell you about the register or style of the text: literary, technical, archaic, regional.
+
+```{r}
+#| label: fig-rarest
+#| fig-cap: "The 15 rarest content words, by general frequency"
+vocab |>
+  filter(!stopword, zipf_general > 0) |>
+  slice_min(zipf_general, n = 15, with_ties = FALSE) |>
+  ggplot(aes(x = zipf_general, y = reorder(word, -zipf_general))) +
+  geom_col(fill = "#2E86AB") +
+  labs(x = "Zipf in general Italian (lower = rarer)", y = NULL)
+```
+
+### Text frequency vs general frequency
+
+Each point is a word: how common it is in Italian (x) against how many times it appears in this text (y). Words in the **upper left** are rare in general but repeated here, so they characterise the text.
+
+```{r}
+#| label: fig-text-vs-general
+#| fig-cap: "Occurrences in the text vs frequency in general Italian"
+plot_data <- vocab |> filter(zipf_general > 0)
+to_label  <- plot_data |> filter(!stopword, count >= 2 | zipf_general < 2.6)
+
+ggplot(plot_data, aes(x = zipf_general, y = count)) +
+  geom_jitter(aes(colour = stopword), alpha = 0.6, size = 2,
+              width = 0, height = 0.08) +
+  geom_text(data = to_label, aes(label = word),
+            vjust = -0.9, size = 3.5, check_overlap = TRUE) +
+  scale_y_log10() +
+  scale_colour_manual(values = c(`FALSE` = "#2E86AB", `TRUE` = "#BBBBBB"),
+                      labels = c("Content word", "Stopword")) +
+  labs(x = "Zipf in general Italian", y = "Occurrences in this text (log scale)",
+       colour = NULL)
+```
+
+### The most characteristic words (keyness)
+
+Keyness is only reliable for words that appear more than once: with a single occurrence, any rare word looks "characteristic". Set `min_count` higher for long texts (e.g. 3-5 for several thousand words).
+
+```{r}
+#| label: fig-keyness
+#| fig-cap: "Words most over-represented compared with general Italian"
+min_count <- 2
+
+vocab |>
+  filter(!stopword, zipf_general > 0, count >= min_count) |>
+  slice_max(keyness, n = 15, with_ties = FALSE) |>
+  ggplot(aes(x = keyness, y = reorder(word, keyness))) +
+  geom_col(fill = "#A23B72") +
+  labs(x = "Keyness (Zipf in text minus Zipf general)", y = NULL)
+```
+
+## Next steps
+
+- **Compare several texts**: in Python, repeat the extraction for each file and add a `text` column. In R, use `facet_wrap(~ text)` on the plots.
+- **Better lemmas**: the small model gets some lemmas wrong. Install `it_core_news_lg` and change the name in `spacy.load()`.
+- **Keywords per text**: with several texts, compute TF-IDF in R with `tidytext::bind_tf_idf()`.

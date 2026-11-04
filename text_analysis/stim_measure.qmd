@@ -1,0 +1,10 @@
+# measuring the stimulus
+
+we will use python to extract the features from the text and use R to analys + plotting.
+import the libs
+```{python}
+import sys
+from collections import Counter
+import spacy
+```
+

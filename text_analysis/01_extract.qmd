@@ -1,0 +1,170 @@
+---
+title: "Italian Text Analysis, Part 1: Feature Extraction"
+subtitle: "Python only (spaCy + wordfreq). Writes words.csv, sentences.csv and vocab.csv"
+jupyter: textanalysis   # the Jupyter kernel of your conda env (see Setup)
+format:
+  html:
+    toc: true
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: false
+---
+
+## Setup
+
+This file contains only Python, so Quarto runs it with **Jupyter**. The `jupyter:` line in the header chooses the kernel, and the kernel decides which conda env is used.
+
+One-time setup, in a terminal (Anaconda Prompt on Windows):
+
+```bash
+conda create -n textanalysis python=3.12
+conda activate textanalysis
+pip install spacy pandas wordfreq ipykernel
+python -m spacy download it_core_news_sm
+
+# Register the env as a Jupyter kernel called "textanalysis"
+python -m ipykernel install --user --name textanalysis --display-name "Python (textanalysis)"
+```
+
+Then render with `quarto render 01_extract.qmd`.
+
+Check that the right env is used:
+
+```{python}
+#| label: check-env
+import sys
+print(sys.executable)
+```
+
+## Feature extraction
+
+### The text
+
+To analyse your own text, put the file path in `TEXT_FILE`. If you leave it empty, the sample text is used.
+
+```{python}
+#| label: text
+TEXT_FILE = ""   # e.g. "my_text.txt" (saved as UTF-8)
+
+SAMPLE_TEXT = """Nel mezzo del cammin di nostra vita mi ritrovai per una selva oscura,
+ché la diritta via era smarrita. Ahi quanto a dir qual era è cosa dura
+esta selva selvaggia e aspra e forte che nel pensier rinova la paura!
+Tant' è amara che poco è più morte; ma per trattar del ben ch'i' vi trovai,
+dirò de l'altre cose ch'i' v'ho scorte.
+La città era silenziosa quella mattina. Le strade, ancora bagnate dalla pioggia
+della notte, brillavano sotto gli ultimi lampioni accesi. Marco camminava piano,
+pensando all'estate passata al mare con gli amici, alle lunghe serate sulla
+spiaggia e alle promesse fatte e mai mantenute. Che strana giornata, pensò.
+Si fermò davanti al bar della piazza. Il barista lo salutò con un cenno.
+Prese un caffè, poi un altro. Fuori, la città cominciava lentamente a svegliarsi:
+le prime macchine, le voci dei bambini che andavano a scuola, il rumore delle
+serrande che si alzavano. Domani, forse, il sole sarebbe tornato a splendere
+sulla città, e lui avrebbe finalmente deciso cosa fare della sua vita."""
+
+if TEXT_FILE:
+    with open(TEXT_FILE, encoding="utf-8") as f:
+        text = f.read()
+else:
+    text = SAMPLE_TEXT
+```
+
+### The spaCy model
+
+```{python}
+#| label: model
+import re
+import spacy
+import pandas as pd
+from wordfreq import zipf_frequency
+
+nlp = spacy.load("it_core_news_sm")
+
+# Split sentences reliably on . ! ? (the parser alone sometimes merges them)
+nlp.add_pipe("sentencizer", before="parser")
+
+# Fixes to spaCy's Italian stopword list:
+# it includes "città" (it shouldn't) and misses some articles
+nlp.vocab["città"].is_stop = False
+for w in ["i", "gli", "le", "lo", "l"]:
+    nlp.Defaults.stop_words.add(w)
+    nlp.vocab[w].is_stop = True
+
+# Line breaks inside a sentence should not act as separators
+clean_text = re.sub(r"\s+", " ", text).strip()
+doc = nlp(clean_text)
+```
+
+### Word table (one row per word)
+
+We keep only alphabetic tokens, so no punctuation, numbers or spaces.
+
+```{python}
+#| label: word-table
+rows = []
+for sentence_id, sentence in enumerate(doc.sents, start=1):
+    for tok in sentence:
+        if tok.is_alpha:
+            rows.append({
+                "sentence": sentence_id,
+                "word":     tok.lower_,
+                "lemma":    tok.lemma_.lower(),
+                "pos":      tok.pos_,        # part of speech: NOUN, VERB, ...
+                "stopword": tok.is_stop,
+                "length":   len(tok.text),   # number of letters
+            })
+
+words = pd.DataFrame(rows)
+words.head(10)
+```
+
+### Sentence table (one row per sentence)
+
+```{python}
+#| label: sentence-table
+sentences = pd.DataFrame([
+    {
+        "sentence": i,
+        "n_words":  sum(1 for t in s if t.is_alpha),
+        "text":     s.text.strip(),
+    }
+    for i, s in enumerate(doc.sents, start=1)
+])
+sentences = sentences[sentences["n_words"] > 0].reset_index(drop=True)
+sentences.head()
+```
+
+### General frequency in Italian (wordfreq)
+
+**wordfreq** gives the frequency of a word in general Italian, combined from several large corpora (Wikipedia, subtitles, news, web text, books and others). It uses the **Zipf scale**:
+
+| Zipf | Meaning | Example |
+|---|---|---|
+| 7 | extremely common | *il*, *di* |
+| 5–6 | common everyday word | *città*, *casa* |
+| 3–4 | less common, still familiar | *selva*, *barista* |
+| 1–2 | rare | |
+| 0 | not in the lists | archaic or very rare forms |
+
+Zipf = log10(occurrences per billion words), so each step up means 10× more frequent.
+
+```{python}
+#| label: general-frequency
+vocab = words.groupby("word", as_index=False).agg(
+    count=("word", "size"),
+    stopword=("stopword", "first"),
+)
+vocab["zipf_general"] = [zipf_frequency(w, "it") for w in vocab["word"]]
+vocab.sort_values("zipf_general").head()
+```
+
+Save the tables as CSV. `02_analyse.qmd` reads them, and you can also open them in Excel or anything else without rerunning the extraction.
+
+```{python}
+#| label: save-csv
+words.to_csv("words.csv", index=False)
+sentences.to_csv("sentences.csv", index=False)
+vocab.to_csv("vocab.csv", index=False)
+```
+
+Done. Now render `02_analyse.qmd` in the same folder.
