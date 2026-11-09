@@ -1,0 +1,12 @@
+{
+  "hash": "8186c6069dc8561cae68b02ea9f3b0be",
+  "result": {
+    "engine": "jupyter",
+    "markdown": "---\ntitle: \"Test\"\nformat:\n  html:\n    embed-resources: true\n---\n\n## Quick check\n\n::: {#b324d0ce .cell execution_count=1}\n``` {.python .cell-code}\nimport matplotlib.pyplot as plt\nplt.plot([1, 2, 3], [4, 1, 2])\nplt.title(\"Test plot\")\nplt.show()\n```\n\n::: {.cell-output .cell-output-display}\n![](my-first-doc_files/figure-html/cell-2-output-1.png){width=571 height=432}\n:::\n:::\n\n\nSome regular markdown text, a **bold word**, and a [link](https://quarto.org).\n\n",
+    "supporting": [
+      "my-first-doc_files"
+    ],
+    "filters": [],
+    "includes": {}
+  }
+}
